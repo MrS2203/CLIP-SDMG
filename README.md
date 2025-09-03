@@ -44,6 +44,13 @@ Further supplementary experiments and theoretical details can be found at the fo
 
 
 
+## ViT-B/16 as the teacher
+
+| [CC3M+12M teacher](https://github.com/MrS2203/CLIP-SDMG/releases/download/v1.0/ViT_B_16_cc3m_12m_ep32.pt) | [laion400m teacher](https://github.com/MrS2203/CLIP-SDMG/releases/download/v2.0/ViT_B_16-laion400m_e32.pt) |
+| ------------------------------------------------------------ | ------------------------------------------------------------ |
+
+
+
 ## Acknowledgement
 
 Our codebase is bulit over [open_clip](https://github.com/mlfoundations/open_clip), an open-source codebase to run CLIP models.
