@@ -1,0 +1,16 @@
+{
+  "embed_dim": "图像与文本共享的嵌入向量维度（即多模态对齐后的统一特征空间维度）",
+  "vision_cfg": {
+    "image_size": "输入图像的分辨率（如224表示224×224像素）",
+    "layers": "视觉Transformer中的编码层（Encoder）数量",
+    "width": "视觉Transformer中每个patch的嵌入维度",
+    "patch_size": "划分图像时每个patch的尺寸（如16表示16×16的图像块）"
+  },
+  "text_cfg": {
+    "context_length": "文本输入的最大Token长度（即最大序列长度）",
+    "vocab_size": "词汇表大小，用于Token嵌入层",
+    "width": "文本Transformer中每个Token的嵌入维度",
+    "heads": "多头自注意力机制中的注意力头数",
+    "layers": "文本Transformer中的编码层数量"
+  }
+}
