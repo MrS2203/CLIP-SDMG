@@ -2,21 +2,21 @@
 
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pad_sequence
 
 
-# 教师模型（ViT-B-16）的视觉/文本特征宽度
+# ---- 教师模型（ViT-B-16）的视觉/文本特征宽度 ----
 TEACHER_VISION_DIM = 768
 TEACHER_TEXT_DIM = 512
 
-# Transformer 的编码层总数
+# ---- Transformer 的编码层总数 ----
 TOTAL_LAYERS = 12
 
-# 全局语义渐进式蒸馏（PGS）使用的层号
-DISTILL_LAYERS = (0, 1, 6, 11)
-# 注意力浅层模仿（DAB）使用的层号
-DAB_LAYERS = (0, 1, 6)
+# ---- 蒸馏使用的默认层号 ----
+DISTILL_LAYERS = (0, 1, 6, 11)   # PGS 全局语义渐进蒸馏
+DAB_LAYERS = (0, 1, 6)           # DAB 注意力浅层模仿
 
-# 学生模型各模态的宽度：{模型名: (视觉宽度, 文本宽度)}
+# ---- 学生模型各模态的宽度：{模型名: (视觉宽度, 文本宽度)} ----
 MODEL_DIMS = {
     'ViT-M-16': (512, 512),
     'ViT-S-16': (384, 384),
@@ -32,9 +32,37 @@ def get_student_dims(model_name):
     return None
 
 
+# ---------------------------------------------------------------------------
+# 文本 token 工具
+# ---------------------------------------------------------------------------
+
+def extract_valid_tokens(text, feature):
+    """提取每个文本中 eot_token 之前的有效 token 特征。
+
+    输入 token 格式: [sot] + encode(text) + [eot] + padding...
+    输出: 去掉 sot/eot 的 encode(text) 部分，用 0 padding 到 batch 内最长长度。
+
+    Args:
+        text:    [B, T] 文本 token 序列（LongTensor）
+        feature: [B, T, D] 对应位置的 encoder 输出特征
+
+    Returns:
+        [B, max_valid_tokens, D] 有效 token 特征，不足处补 0。
+    """
+    eot_positions = text.argmax(dim=-1)
+    valid_tokens = [feature[i, 1:eot_positions[i]] for i in range(feature.shape[0])]
+    return pad_sequence(valid_tokens, batch_first=True, padding_value=0)
+
+
+# ---------------------------------------------------------------------------
+# 多层投影模块
+# ---------------------------------------------------------------------------
+
 class MultiLayerLinearProjection(nn.Module):
     """把多个中间层特征分别线性投影到教师维度。
 
+    forward 输入: [B, num_layers, N, D_in]
+    输出:        [B, num_layers, N, D_out]
     当输入维度未知（不支持的模型）时退化为恒等映射。
     """
 

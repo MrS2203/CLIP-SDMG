@@ -91,6 +91,20 @@ def parse_args(args):
     parser.add_argument("--alpha_dab_loss", type=float, default=1., help="DABLoss weight")
     # GEN
     parser.add_argument("--alpha_gen_loss", type=float, default=1., help="GENLoss weight")
+
+    # === 蒸馏层号 & mask 超参 ===
+    parser.add_argument(
+        "--distill-layers", type=str, default="0,1,6,11",
+        help="PGS 蒸馏使用的 Transformer 层号，逗号分隔")
+    parser.add_argument(
+        "--dab-layers", type=str, default="0,1,6",
+        help="DAB 注意力模仿使用的 Transformer 层号，逗号分隔")
+    parser.add_argument(
+        "--dab-mask-alpha", type=float, default=0.5,
+        help="DAB 注意力阈值系数: mean + alpha * std")
+    parser.add_argument(
+        "--gen-mask-ratio", type=float, default=0.5,
+        help="视觉生成损失的 token 遮挡比例")
     parser.add_argument(
         "--tag",  # 实验标签
         type=str,
@@ -297,5 +311,9 @@ def parse_args(args):
     for name, val in default_params.items():
         if getattr(args, name) is None:
             setattr(args, name, val)
+
+    # 将层号字符串解析为 tuple，例如 "0,1,6,11" → (0, 1, 6, 11)
+    args.distill_layers = tuple(int(x.strip()) for x in args.distill_layers.split(','))
+    args.dab_layers = tuple(int(x.strip()) for x in args.dab_layers.split(','))
 
     return args

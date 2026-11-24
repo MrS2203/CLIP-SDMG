@@ -217,13 +217,18 @@ class CLIP(nn.Module):
         return F.normalize(x, dim=-1) if normalize else x, intermediate_features, attention_weights
 
     def forward(self, image, text, distill=False, layers=(), attn_layers=()):
-        flag = True
-        if distill is True:
-            flag = False
+        """
+        Args:
+            distill: True 时返回**未归一化**的原始特征（供 PGS/DAB/GEN 蒸馏损失
+                在教师原始空间做逐元素对齐）；False 时返回 L2 归一化特征（供
+                CLIP 对比损失做余弦相似度）。
+        """
+        # 蒸馏分支需要原始特征空间；CLIP 任务分支后续在 Loss 里自行 normalize
+        should_normalize = not distill
         image_features, intermediate_features, attention_weights = self.encode_image(
-            image, normalize=flag, layers=layers, attn_layers=attn_layers)
+            image, normalize=should_normalize, layers=layers, attn_layers=attn_layers)
         text_features, txt_intermediate_features, txt_attention_weights = self.encode_text(
-            text, normalize=flag, layers=layers, attn_layers=attn_layers)
+            text, normalize=should_normalize, layers=layers, attn_layers=attn_layers)
         return image_features, intermediate_features, text_features, txt_intermediate_features, self.logit_scale.exp(), [
             attention_weights, txt_attention_weights]
 

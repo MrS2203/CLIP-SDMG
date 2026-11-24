@@ -163,6 +163,8 @@ def main(args):
     checkpoint = torch.load(args.t_model_checkpoint, map_location='cpu', weights_only=True)
     # 兼容两种发布格式：ViT_B_16_cc3m_12m_ep32.pt 为 {"state_dict": ...}，ViT_B_16-laion400m_e32.pt 为裸 state_dict
     sd = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+    if not isinstance(sd, dict) or not sd:
+        raise ValueError(f"Checkpoint at {args.t_model_checkpoint} has no usable state_dict (got {type(sd).__name__}).")
     if next(iter(sd.items()))[0].startswith('module'):
         sd = {k[len('module.'):]: v for k, v in sd.items()}
     t_model.load_state_dict(sd)

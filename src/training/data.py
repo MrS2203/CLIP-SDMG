@@ -127,11 +127,14 @@ class RetrievalDataset(Dataset):
     def __getitem__(self, index):
         img_key = self.img_keys[index]
         if 'coco' in self.data_path:
-            image = Image.open(
-                os.path.join(self.data_path, 'images/val2014/', 'COCO_val2014_{:012}.jpg'.format(img_key)))
+            img_path = os.path.join(
+                self.data_path, 'images/val2014/',
+                'COCO_val2014_{:012}.jpg'.format(img_key))
         else:
-            image = Image.open(os.path.join(self.data_path, 'images/{}.jpg'.format(img_key)))
-        image = self.transform(image)
+            img_path = os.path.join(self.data_path, 'images/{}.jpg'.format(img_key))
+        # 使用上下文管理器确保文件句柄及时关闭，避免 Windows 下频繁打开触发 OSError
+        with Image.open(img_path) as image_file:
+            image = self.transform(image_file)
 
         captions = self.captions[img_key]
         # if len(captions) > 5:

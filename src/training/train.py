@@ -13,7 +13,6 @@ except ImportError:
     wandb = None
 
 from src.open_clip import get_cast_dtype
-from src.loss.common import DAB_LAYERS, DISTILL_LAYERS
 from src.training.metrics import get_metrics
 from src.training.zero_shot import zero_shot_eval
 from src.training.precision import get_autocast
@@ -39,10 +38,23 @@ class AverageMeter(object):
 
 
 def unwrap_model(model):
-    if hasattr(model, 'module'):
-        return model.module
+    return getattr(model, 'module', model)
+
+
+def _clip_gradients(model, optimizer, args, scaler=None):
+    """对 model.parameters() 做全局梯度裁剪。
+
+    兼容 AMP GradScaler：有 scaler 时先 unscale 再 clip，再 step；无 scaler 时直接 step。
+    """
+    if scaler is not None:
+        scaler.unscale_(optimizer)
+    if args.grad_clip_norm is not None:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
     else:
-        return model
+        optimizer.step()
 
 
 def train_kd_one_epoch(model, t_model, data, epoch, loss, optimizer, scaler, scheduler, args, tb_writer=None):
@@ -108,15 +120,15 @@ def train_kd_one_epoch(model, t_model, data, epoch, loss, optimizer, scaler, sch
                 images,
                 texts,
                 distill=True,
-                layers=DISTILL_LAYERS,
-                attn_layers=DAB_LAYERS)
+                layers=args.distill_layers,
+                attn_layers=args.dab_layers)
 
             # 因为教师模型不需要更新 因此不需要计算梯度
             with torch.no_grad():
                 t_image_features, t_intermediate_features, t_text_features, t_txt_intermediate_features, _, t_attention_weights = t_model(
                     images, texts,
-                    layers=DISTILL_LAYERS,
-                    attn_layers=DAB_LAYERS)
+                    layers=args.distill_layers,
+                    attn_layers=args.dab_layers)
 
             # 损失函数
             losses = loss(image_features, text_features, logit_scale,  # 学生模型最终的图像和文本特征以及logit_scale
@@ -129,18 +141,14 @@ def train_kd_one_epoch(model, t_model, data, epoch, loss, optimizer, scaler, sch
             total_loss = (losses.task_loss + losses.fd_loss + losses.gen_loss +
                           losses.pgs_loss + losses.dab_loss)
 
+        # backward（有 AMP scaler 时用 scale 包一层，避免 fp16 梯度下溢）
         if scaler is not None:
             scaler.scale(total_loss).backward()
-            if args.grad_clip_norm is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
-            scaler.step(optimizer)
-            scaler.update()
         else:
             total_loss.backward()
-            if args.grad_clip_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
-            optimizer.step()
+
+        # unscale → clip → step → update（兼容 AMP / 非 AMP 两条路径）
+        _clip_gradients(model, optimizer, args, scaler)
 
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
         with torch.no_grad():
@@ -233,7 +241,7 @@ def evaluate(model, data, epoch, args, tb_writer=None):
 
                 with autocast():
                     # 模型推理
-                    image_features, intermediate_features, text_features, txt_intermediate_features, logit_scale, an = model(
+                    image_features, intermediate_features, text_features, txt_intermediate_features, logit_scale, _ = model(
                         images, texts)
                     # features are accumulated in CPU tensors, otherwise GPU memory exhausted quickly
                     # however, system RAM is easily exceeded and compute time becomes problematic
