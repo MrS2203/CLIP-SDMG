@@ -13,11 +13,11 @@ GEN_BETA_TEXT = 0.006
 GEN_MASK_RATIO = 0.5
 
 
-class gen_loss(nn.Module):
+class GENLoss(nn.Module):
     def __init__(self, args):
-        super(gen_loss, self).__init__()
+        super(GENLoss, self).__init__()
         # 视觉生成
-        self.mvm = gen_EmbTrans(args.model)
+        self.mvm = TokenGenerator(args.model)
         # 文本解码器
         self.mlm = MLM(args)
         # 文本生成损失
@@ -56,14 +56,14 @@ class gen_loss(nn.Module):
 
 
 # VIT 11生成
-class gen_EmbTrans(nn.Module):
+class TokenGenerator(nn.Module):
     """最后一层的掩码生成：先对齐到教师维度，再遮挡部分 token 并重建。"""
 
     def __init__(self,
                  model_name,
                  lambda_vitkd=GEN_MASK_RATIO,
                  ):
-        super(gen_EmbTrans, self).__init__()
+        super(TokenGenerator, self).__init__()
         self.model_name = model_name
         # 遮挡比例
         self.lambda_vitkd = lambda_vitkd

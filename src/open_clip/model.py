@@ -194,73 +194,38 @@ class CLIP(nn.Module):
         self.visual.set_grad_checkpointing(enable)
         self.transformer.grad_checkpointing = enable
 
-    def encode_image(self, image, normalize: bool = False):
-        features, intermediate_features, attention_weights = self.visual(image)
+    def encode_image(self, image, normalize: bool = False, layers=(), attn_layers=()):
+        features, intermediate_features, attention_weights = self.visual(
+            image, layers=layers, attn_layers=attn_layers)
         return F.normalize(features, dim=-1) if normalize else features, intermediate_features, attention_weights
 
-    def encode_text(self, text, normalize: bool = False):
+    def encode_text(self, text, normalize: bool = False, layers=(), attn_layers=()):
         cast_dtype = self.transformer.get_cast_dtype()
 
         x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.to(cast_dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x, intermediate_features, attention_weights = self.transformer(x, attn_mask=self.attn_mask)
+        x, intermediate_features, attention_weights = self.transformer(
+            x, attn_mask=self.attn_mask, layers=layers, attn_layers=attn_layers)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
-        intermediate_features = [i.permute(1, 0, 2) for i in intermediate_features]  # [p+1, B,维度]->[B,p+1,维度]
+        intermediate_features = [i.permute(1, 0, 2) if i is not None else None
+                                 for i in intermediate_features]  # [p+1, B,维度]->[B,p+1,维度]
         return F.normalize(x, dim=-1) if normalize else x, intermediate_features, attention_weights
 
-    def forward(self, image, text, distill=False):
+    def forward(self, image, text, distill=False, layers=(), attn_layers=()):
         flag = True
         if distill is True:
             flag = False
-        image_features, intermediate_features, attention_weights = self.encode_image(image, normalize=flag)
-        text_features, txt_intermediate_features, txt_attention_weights = self.encode_text(text, normalize=flag)
+        image_features, intermediate_features, attention_weights = self.encode_image(
+            image, normalize=flag, layers=layers, attn_layers=attn_layers)
+        text_features, txt_intermediate_features, txt_attention_weights = self.encode_text(
+            text, normalize=flag, layers=layers, attn_layers=attn_layers)
         return image_features, intermediate_features, text_features, txt_intermediate_features, self.logit_scale.exp(), [
             attention_weights, txt_attention_weights]
-
-
-class CustomTextCLIP(nn.Module):
-    def __init__(
-            self,
-            embed_dim: int,
-            vision_cfg: CLIPVisionCfg,
-            text_cfg: CLIPTextCfg,
-            quick_gelu: bool = False,
-            cast_dtype: Optional[torch.dtype] = None,
-    ):
-        super().__init__()
-        self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
-        self.text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-
-    def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
-        # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
-        self.visual.lock(unlocked_groups=unlocked_groups, freeze_bn_stats=freeze_bn_stats)
-
-    def lock_text_tower(self, unlocked_layers: int = 0, freeze_layer_norm: bool = True):
-        self.text.lock(unlocked_layers, freeze_layer_norm)
-
-    @torch.jit.ignore
-    def set_grad_checkpointing(self, enable=True):
-        self.visual.set_grad_checkpointing(enable)
-        self.text.set_grad_checkpointing(enable)
-
-    def encode_image(self, image, normalize: bool = False):
-        features = self.visual(image)
-        return F.normalize(features, dim=-1) if normalize else features
-
-    def encode_text(self, text, normalize: bool = False):
-        features = self.text(text)
-        return F.normalize(features, dim=-1) if normalize else features
-
-    def forward(self, image, text):
-        image_features = self.encode_image(image, normalize=True)
-        text_features = self.encode_text(text, normalize=True)
-        return image_features, text_features, self.logit_scale.exp()
 
 
 def convert_weights_to_lp(model: nn.Module, dtype=torch.float16):

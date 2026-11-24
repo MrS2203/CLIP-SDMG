@@ -5,7 +5,7 @@ This repository contains the source code of CLIP-SDMG [CLIP-SDMG:CLIP knowledge 
 
 ## Install
 
-Python >= 3.8 is required.
+Python >= 3.8 and PyTorch >= 2.3 are required (the code uses the unified `torch.amp` API).
 
 ```
 pip install -r requirements-training.txt
@@ -74,6 +74,33 @@ python -m src.training.main_kd \
 ```
 
 The student checkpoint is loaded from `--resume`; without `--train-data` the script runs evaluation only.
+
+## Key arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--model` / `--t-model` | `ViT-T-16` / `ViT-B-16` | Student / teacher backbone names (see `src/open_clip/model_configs`). |
+| `--alpha_fd_loss` | `2000` | Weight of the feature-distillation loss. |
+| `--alpha_pgs_loss` | `1` | Weight of the progressive global-semantic loss. |
+| `--alpha_dab_loss` | `1` | Weight of the attention-based shallow imitation loss. |
+| `--alpha_gen_loss` | `1` | Weight of the masked-generation loss. |
+| `--precision` | `amp` | One of `amp`, `amp_bf16`, `bf16`, `fp16`, `fp32`. |
+| `--workers` | `4` | DataLoader worker processes. |
+| `--val-frequency` | `1` | Run retrieval evaluation every N epochs. |
+| `--save-frequency` | `1` | Save a checkpoint every N epochs. |
+| `--deterministic` | off | Enables deterministic cuDNN and disables `cudnn.benchmark`. |
+| `--grad-clip-norm` | none | Optional gradient clipping norm. |
+
+Evaluation uses chunked retrieval-metric computation, so peak memory stays bounded on the 13K CC3M validation set.
+
+## Tests
+
+```bash
+pip install pytest
+python -m pytest -q
+```
+
+The test suite covers MLM batched decoding, PGS loss equivalence, sparse transformer collection, chunked retrieval metrics, and an end-to-end CPU forward/loss check.
 
 
 

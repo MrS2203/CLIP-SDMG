@@ -18,9 +18,9 @@ DAB_ALPHA_TEXT = 0.0003
 DAB_MASK_ALPHA = 0.5
 
 
-class dab_loss(nn.Module):
+class DABLoss(nn.Module):
     def __init__(self, args):
-        super(dab_loss, self).__init__()
+        super(DABLoss, self).__init__()
         self.model_name = args.model
 
         dims = get_student_dims(args.model)
@@ -69,8 +69,9 @@ class dab_loss(nn.Module):
 
         B = intermediate_features[DAB_LAYERS[0]].shape[0]
         patches = intermediate_features[DAB_LAYERS[0]].shape[1]
-        loss_dab_vision = self.mse_sum(s_vision_features, t_vision_features) / B * DAB_ALPHA_VISION / (
-                mask_number / len(DAB_LAYERS) / patches)
+        # mask_number 为 0 时分子也为 0，clamp 避免除零产生 NaN
+        masked_ratio = (mask_number / len(DAB_LAYERS) / patches).clamp_min(1e-6)
+        loss_dab_vision = self.mse_sum(s_vision_features, t_vision_features) / B * DAB_ALPHA_VISION / masked_ratio
 
         # 文本部分
         """
@@ -81,8 +82,8 @@ class dab_loss(nn.Module):
         """
         # 获取每个文本token的长度
         txt_token_length = texts.argmax(dim=-1) - 1
-        # 计算文本长度的总和
-        total_txt_length = txt_token_length.sum()
+        # 计算文本长度的总和，clamp 避免空文本导致除零
+        total_txt_length = txt_token_length.sum().clamp_min(1)
 
         s_txt_features = torch.stack(
             [extract_valid_tokens(texts, txt_intermediate_features[layer]) for layer in DAB_LAYERS],

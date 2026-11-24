@@ -16,13 +16,7 @@ def zero_shot_classifier(model, classnames, templates, args):
         for classname in tqdm(classnames):
             texts = [template(classname) for template in templates]  # format with class
             texts = tokenizer(texts).to(args.device)  # tokenize
-            if args.distributed and not args.horovod:
-                if hasattr(model, 'module'):
-                    class_embeddings = model.module.encode_text(texts)[0]
-                else:
-                    class_embeddings = model.encode_text(texts)[0]
-            else:
-                class_embeddings = model.encode_text(texts)[0]
+            class_embeddings = model.encode_text(texts)[0]
             class_embedding = F.normalize(class_embeddings, dim=-1).mean(dim=0)
             class_embedding /= class_embedding.norm()
             zeroshot_weights.append(class_embedding)
@@ -54,13 +48,7 @@ def run(model, classifier, dataloader, args, name):
 
             with autocast():
                 # predict
-                if args.distributed and not args.horovod:
-                    if hasattr(model, 'module'):
-                        image_features = model.module.encode_image(images)[0]
-                    else:
-                        image_features = model.encode_image(images)[0]
-                else:
-                    image_features = model.encode_image(images)[0]
+                image_features = model.encode_image(images)[0]
                 image_features = F.normalize(image_features, dim=-1)
                 logits = 100. * image_features @ classifier
 

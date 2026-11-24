@@ -151,16 +151,19 @@ class ResidualAttentionBlock(nn.Module):
         ]))
         self.ls_2 = LayerScale(d_model, ls_init_value) if ls_init_value else nn.Identity()
 
-    def attention(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
+    def attention(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, need_weights: bool = True):
         attn_mask = attn_mask.to(x.dtype) if attn_mask is not None else None
-        attn_output, attn_weights = self.attn(x, x, x, need_weights=True, attn_mask=attn_mask)
-        return attn_output, attn_weights  # 返回注意力输出和注意力矩阵
+        if need_weights:
+            attn_output, attn_weights = self.attn(x, x, x, need_weights=True, attn_mask=attn_mask)
+            return attn_output, attn_weights  # 返回注意力输出和注意力矩阵
+        attn_output = self.attn(x, x, x, need_weights=False, attn_mask=attn_mask)[0]
+        return attn_output, None
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
-        attn_output, attn_weights = self.attention(self.ln_1(x), attn_mask=attn_mask)
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, need_weights: bool = True):
+        attn_output, attn_weights = self.attention(self.ln_1(x), attn_mask=attn_mask, need_weights=need_weights)
         x = x + self.ls_1(attn_output)
         x = x + self.ls_2(self.mlp(self.ln_2(x)))
-        return x, attn_weights  # 返回注意力矩阵
+        return x, attn_weights  # 返回注意力矩阵（不需要时为 None）
 
 
 class CustomResidualAttentionBlock(nn.Module):
@@ -229,22 +232,28 @@ class Transformer(nn.Module):
     def get_cast_dtype(self) -> torch.dtype:
         return self.resblocks[0].mlp.c_fc.weight.dtype
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
-        # 用于存储中间特征
-        intermediate_features = []
-        attention_weights = []  # 用于存储每一层的注意力矩阵
-        for r in self.resblocks:
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None,
+                layers=None, attn_layers=None):
+        # layers/attn_layers 为需要保留中间特征/注意力的层号集合，None 表示全部保留
+        collect_layers = set(range(self.layers)) if layers is None else set(layers)
+        collect_attn = set(range(self.layers)) if attn_layers is None else set(attn_layers)
+        intermediate_features = [None] * self.layers
+        attention_weights = [None] * self.layers
+        for i, r in enumerate(self.resblocks):
+            need_attn = i in collect_attn
             if self.grad_checkpointing and not torch.jit.is_scripting():
-                x = checkpoint(r, x, attn_mask)
+                x, attn_w = checkpoint(r, x, attn_mask, need_attn)
             else:
-                x, attn_w = r(x, attn_mask=attn_mask)  # r返回 (attn_output, attn_weights)
-                attention_weights.append(attn_w.clone())  # 保存每层的注意力矩阵
-            # 保存每一层的中间特征
-            intermediate_features.append(x.clone())
+                x, attn_w = r(x, attn_mask=attn_mask, need_weights=need_attn)
+            if need_attn:
+                attention_weights[i] = attn_w.clone()
+            # 只保存需要的中间特征
+            if i in collect_layers:
+                intermediate_features[i] = x.clone()
         return x, intermediate_features, attention_weights
 
 
-class text_Transformer(nn.Module):
+class TextTransformerEncoder(nn.Module):
     def __init__(
             self,
             width: int,
@@ -280,18 +289,24 @@ class text_Transformer(nn.Module):
     def get_cast_dtype(self) -> torch.dtype:
         return self.resblocks[0].mlp.c_fc.weight.dtype
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
-        # 用于存储中间特征
-        intermediate_features = []
-        attention_weights = []  # 用于存储每一层的注意力矩阵
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None,
+                layers=None, attn_layers=None):
+        # layers/attn_layers 为需要保留中间特征/注意力的层号集合，None 表示全部保留
+        collect_layers = set(range(self.layers)) if layers is None else set(layers)
+        collect_attn = set(range(self.layers)) if attn_layers is None else set(attn_layers)
+        intermediate_features = [None] * self.layers
+        attention_weights = [None] * self.layers
         for i, r in enumerate(self.resblocks):
+            need_attn = i in collect_attn
             if self.grad_checkpointing and not torch.jit.is_scripting():
-                x = checkpoint(r, x, attn_mask)
+                x, attn_w = checkpoint(r, x, attn_mask, need_attn)
             else:
-                x, attn_w = r(x, attn_mask=attn_mask)  # r返回 (attn_output, attn_weights)
-                attention_weights.append(attn_w.clone())  # 保存每层的注意力矩阵
-            # 保存每一层的中间特征
-            intermediate_features.append(x.clone())
+                x, attn_w = r(x, attn_mask=attn_mask, need_weights=need_attn)
+            if need_attn:
+                attention_weights[i] = attn_w.clone()
+            # 只保存需要的中间特征
+            if i in collect_layers:
+                intermediate_features[i] = x.clone()
             # 1. 判断当前层数和模型名称是否一致
             if i == self.layer and self.model_name != TEACHER_MODEL_NAME:
                 # [77, batch, dim] -> [batch, 77, dim]
@@ -406,7 +421,7 @@ class VisionTransformer(nn.Module):
 
         return x_masked, mask, ids_restore
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, layers=None, attn_layers=None):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -421,9 +436,11 @@ class VisionTransformer(nn.Module):
         """
         x此时就是intermediate_features中的最后一个x
         """
-        x, intermediate_features, attention_weights = self.transformer(x)
+        x, intermediate_features, attention_weights = self.transformer(
+            x, layers=layers, attn_layers=attn_layers)
         x = x.permute(1, 0, 2)  # LND -> NLD2
-        intermediate_features = [i.permute(1, 0, 2) for i in intermediate_features]  # [p+1, B,维度]->[B,p+1,维度]
+        intermediate_features = [i.permute(1, 0, 2) if i is not None else None
+                                 for i in intermediate_features]  # [p+1, B,维度]->[B,p+1,维度]
 
         # 在这里就已经将所有图像的CLStoken进行了提取
         x = self.ln_post(x[:, 0, :])
@@ -485,7 +502,7 @@ class TextTransformer(nn.Module):
 
         self.token_embedding = nn.Embedding(vocab_size, width)
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, width))
-        self.transformer = text_Transformer(
+        self.transformer = TextTransformerEncoder(
             width=width,
             layers=layers,
             heads=heads,
@@ -536,7 +553,7 @@ class TextTransformer(nn.Module):
 
         x = x + self.positional_embedding.to(cast_dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x, attn_mask=self.attn_mask)
+        x = self.transformer(x, attn_mask=self.attn_mask)[0]
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x)
 

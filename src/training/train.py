@@ -4,7 +4,6 @@ import math
 import os
 import time
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -14,6 +13,8 @@ except ImportError:
     wandb = None
 
 from src.open_clip import get_cast_dtype
+from src.loss.common import DAB_LAYERS, DISTILL_LAYERS
+from src.training.metrics import get_metrics
 from src.training.zero_shot import zero_shot_eval
 from src.training.precision import get_autocast
 
@@ -74,6 +75,10 @@ def train_kd_one_epoch(model, t_model, data, epoch, loss, optimizer, scaler, sch
     for i, batch in enumerate(dataloader):
         step = num_batches_per_epoch * epoch + i
 
+        # 整个 batch 都读取失败时跳过，避免解包 None 崩溃
+        if batch is None:
+            continue
+
         # 调整学习率
         if not args.skip_scheduler:
             scheduler(step)
@@ -102,38 +107,34 @@ def train_kd_one_epoch(model, t_model, data, epoch, loss, optimizer, scaler, sch
             image_features, intermediate_features, text_features, txt_intermediate_features, logit_scale, attention_weights = model(
                 images,
                 texts,
-                distill=True)
+                distill=True,
+                layers=DISTILL_LAYERS,
+                attn_layers=DAB_LAYERS)
 
             # 因为教师模型不需要更新 因此不需要计算梯度
             with torch.no_grad():
-                t_image_features, t_intermediate_features, t_text_features, t_txt_intermediate_features, t_logit_scale, t_attention_weights = t_model(
-                    images, texts)
+                t_image_features, t_intermediate_features, t_text_features, t_txt_intermediate_features, _, t_attention_weights = t_model(
+                    images, texts,
+                    layers=DISTILL_LAYERS,
+                    attn_layers=DAB_LAYERS)
 
             # 损失函数
             losses = loss(image_features, text_features, logit_scale,  # 学生模型最终的图像和文本特征以及logit_scale
-                          t_image_features, t_text_features, t_logit_scale,  # 教师模型最终的图像和文本特征以及logit_scale
+                          t_image_features, t_text_features,  # 教师模型最终的图像和文本特征
                           intermediate_features, t_intermediate_features,  # 学生和教师模型中间层的视觉特征
                           txt_intermediate_features, t_txt_intermediate_features,  # 学生和教师模型中间层的文本特征
                           attention_weights, t_attention_weights, texts,
                           epoch)  # 学生和教师模型中间层的注意力权重
 
-            task_loss, fd_loss, gen_loss, pgs_loss, dab_loss = losses
-            total_loss = task_loss + fd_loss + gen_loss + pgs_loss + dab_loss
+            total_loss = (losses.task_loss + losses.fd_loss + losses.gen_loss +
+                          losses.pgs_loss + losses.dab_loss)
 
         if scaler is not None:
             scaler.scale(total_loss).backward()
-            if args.horovod:
-                optimizer.synchronize()
+            if args.grad_clip_norm is not None:
                 scaler.unscale_(optimizer)
-                if args.grad_clip_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
-                with optimizer.skip_synchronize():
-                    scaler.step(optimizer)
-            else:
-                if args.grad_clip_norm is not None:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
-                scaler.step(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+            scaler.step(optimizer)
             scaler.update()
         else:
             total_loss.backward()
@@ -157,11 +158,11 @@ def train_kd_one_epoch(model, t_model, data, epoch, loss, optimizer, scaler, sch
 
             # NOTE loss is coarsely sampled, just master node and per log update
             loss_m.update(total_loss.item(), batch_size)
-            loss_task.update(task_loss.item(), batch_size)
-            loss_fd.update(fd_loss.item(), batch_size)
-            loss_gen.update(gen_loss.item(), batch_size)
-            loss_dab.update(dab_loss.item(), batch_size)
-            loss_pgs.update(pgs_loss.item(), batch_size)
+            loss_task.update(losses.task_loss.item(), batch_size)
+            loss_fd.update(losses.fd_loss.item(), batch_size)
+            loss_gen.update(losses.gen_loss.item(), batch_size)
+            loss_dab.update(losses.dab_loss.item(), batch_size)
+            loss_pgs.update(losses.pgs_loss.item(), batch_size)
             logit_scale_scalar = logit_scale.item()
             logging.info(
                 f"Train Epoch: {epoch} [{num_samples:>{sample_digits}}/{samples_per_epoch} ({percent_complete:.0f}%)] "
@@ -218,12 +219,14 @@ def evaluate(model, data, epoch, args, tb_writer=None):
         num_samples = 0
         samples_per_val = dataloader.num_samples
 
-        # FIXME this does not scale past small eval datasets
-        # all_image_features @ all_text_features will blow up memory and compute very quickly
         cumulative_loss = 0.0
+        logit_scale_total = 0.0
+        num_batches = 0
         all_image_features, all_text_features = [], []
         with torch.no_grad():
             for i, batch in enumerate(dataloader):
+                if batch is None:
+                    continue
                 images, texts = batch
                 images = images.to(device=device, dtype=cast_dtype, non_blocking=True)
                 texts = texts.to(device=device, non_blocking=True)
@@ -237,6 +240,8 @@ def evaluate(model, data, epoch, args, tb_writer=None):
                     all_image_features.append(image_features.cpu())
                     all_text_features.append(text_features.cpu())
                     logit_scale = logit_scale.mean()
+                    logit_scale_total += logit_scale.item()
+                    num_batches += 1
                     # 计算相似度
                     logits_per_image = logit_scale * image_features @ text_features.t()
                     logits_per_text = logits_per_image.t()
@@ -257,6 +262,10 @@ def evaluate(model, data, epoch, args, tb_writer=None):
                         f"Eval Epoch: {epoch} [{num_samples} / {samples_per_val}]\t"
                         f"Loss: {cumulative_loss / num_samples:.6f}\t")
 
+            if num_samples == 0:
+                logging.warning("No validation samples were loaded; skip retrieval metrics.")
+                return metrics
+
             # 验证模型性能
             val_metrics = get_metrics(
                 # all_image_features 整个验证集的图像特征
@@ -264,7 +273,7 @@ def evaluate(model, data, epoch, args, tb_writer=None):
                 # all_text_features 整个验证集的文本特征
                 text_features=torch.cat(all_text_features),
                 # 整个验证集的平均缩放因子
-                logit_scale=logit_scale.cpu(),
+                logit_scale=logit_scale_total / num_batches,
             )
             loss = cumulative_loss / num_samples
             metrics.update(
@@ -291,39 +300,3 @@ def evaluate(model, data, epoch, args, tb_writer=None):
 
     return metrics
 
-
-def get_metrics(image_features, text_features, logit_scale):
-    metrics = {}
-    # logits_per_image [B, B] 每张图像对每个文本的匹配得分 (等价于相似度  得分越高,相似度越高)
-    # logits_per_text [B, B] 每个文本对每张图像的匹配得分
-    logits_per_image = (logit_scale * image_features @ text_features.t()).detach().cpu()
-    logits_per_text = logits_per_image.t().detach().cpu()
-    logits = {"image_to_text": logits_per_image, "text_to_image": logits_per_text}
-
-    # ground_trut [B, 1] 每个值表示文本的正确匹配索引
-    ground_truth = torch.arange(len(text_features)).view(-1, 1)
-
-    for name, logit in logits.items():
-        """
-        name:image_to_text, text_to_image
-        logit: 得分矩阵 [B, B]
-        """
-        ranking = torch.argsort(logit, descending=True)
-        preds = torch.where(ranking == ground_truth)[1]
-        preds = preds.detach().cpu().numpy()
-        metrics[f"{name}_mean_rank"] = preds.mean() + 1
-        metrics[f"{name}_median_rank"] = np.floor(np.median(preds)) + 1
-        for k in [1, 5, 10]:
-            metrics[f"{name}_R@{k}"] = np.mean(preds < k)
-
-    """
-    平均排名和中位数排名都是越低越好  召回率越高越好
-    image_to_text_mean_rank: 图像到文本匹配的平均排名
-    image_to_text_median_rank: 图像到文本匹配的中位数排名
-    image_to_text_R@1, R@5, R@10: 图像到文本匹配的前1、5、10名召回率
-
-    text_to_image_mean_rank: 文本到图像匹配的平均排名。
-    text_to_image_median_rank: 文本到图像匹配的中位数排名
-    text_to_image_R@1, R@5, R@10: 文本到图像匹配的前1、5、10名召回率
-    """
-    return metrics

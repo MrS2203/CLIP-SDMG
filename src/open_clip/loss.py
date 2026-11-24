@@ -1,12 +1,21 @@
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from typing import NamedTuple
 
 # 引入我们的蒸馏损失
-from src.loss.PGS_loss import pgs_loss
-from src.loss.DAB_loss import dab_loss
-from src.loss.GEN_loss import gen_loss
+from src.loss.PGS_loss import PGSLoss
+from src.loss.DAB_loss import DABLoss
+from src.loss.GEN_loss import GENLoss
+
+
+class KDLossOutput(NamedTuple):
+    """KD 总损失的具名返回值，避免调用方按位置解包出错。"""
+    task_loss: torch.Tensor
+    fd_loss: torch.Tensor
+    gen_loss: torch.Tensor
+    pgs_loss: torch.Tensor
+    dab_loss: torch.Tensor
 
 
 class ClipLoss(nn.Module):
@@ -61,42 +70,29 @@ class KDClipLoss(nn.Module):
     def __init__(
             self,
             args,
-            local_loss=False,
-            gather_with_grad=False,
             cache_labels=False,
-            use_horovod=False,
     ):
         super().__init__()
-        self.local_loss = local_loss
-        self.gather_with_grad = gather_with_grad
         self.cache_labels = cache_labels
-        self.use_horovod = use_horovod
         self.args = args
 
         if args.t_embed_dim != args.s_embed_dim:
             self.visual_proj = nn.Linear(args.s_embed_dim, args.t_embed_dim)
             self.text_proj = nn.Linear(args.s_embed_dim, args.t_embed_dim)
 
-        if args.patch_vis != args.t_patch_vis:
-            self.visual_cls_vis = nn.Linear(args.patch_vis, args.t_patch_vis)
-        if args.token_txt != args.t_token_txt:
-            self.text_cls_txt = nn.Linear(args.token_txt, args.t_token_txt)
-
         # cache state
         self.prev_num_logits = 0
-        self.cross_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-        self.fusion_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.labels = {}
 
         # 全局语义渐进式蒸馏损失
-        self.pgs_loss = pgs_loss(args)
+        self.pgs_loss = PGSLoss(args)
         # 浅层局部语义蒸馏损失
-        self.dab_loss = dab_loss(args)
+        self.dab_loss = DABLoss(args)
         # 深层局部语义掩码生成损失
-        self.gen_loss = gen_loss(args)
+        self.gen_loss = GENLoss(args)
 
     def forward(self, image_features, text_features, logit_scale,
-                t_image_features, t_text_features, t_logit_scale,
+                t_image_features, t_text_features,
                 intermediate_features, t_intermediate_features,
                 txt_intermediate_features, t_txt_intermediate_features,
                 attention_weights, t_attention_weights, texts, epoch):
@@ -159,4 +155,10 @@ class KDClipLoss(nn.Module):
         pgs_loss = self.args.alpha_pgs_loss * pgs_loss
         gen_loss = self.args.alpha_gen_loss * gen_loss
 
-        return task_loss, fd_loss, gen_loss, pgs_loss, dab_loss
+        return KDLossOutput(
+            task_loss=task_loss,
+            fd_loss=fd_loss,
+            gen_loss=gen_loss,
+            pgs_loss=pgs_loss,
+            dab_loss=dab_loss,
+        )

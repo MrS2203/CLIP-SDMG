@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import optim
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 
 try:
     import torch.utils.tensorboard as tensorboard
@@ -50,8 +50,9 @@ def main(args):
         # float16 and almost as accurate as float32
         # This was a default in pytorch until 1.12
         torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
+        # 确定性模式下关闭 benchmark，保证相同输入的可复现性
+        torch.backends.cudnn.benchmark = not args.deterministic
+        torch.backends.cudnn.deterministic = args.deterministic
 
     # sanitize model name for filesystem / uri use, easier if we don't use / in name as a rule?
     args.model = args.model.replace('/', '-')
@@ -129,7 +130,6 @@ def main(args):
         device=args.device,
         jit=args.torchscript,
         force_quick_gelu=args.force_quick_gelu,
-        force_custom_text=args.force_custom_text,
         pretrained_image=args.pretrained_image,
         image_mean=args.image_mean,  # 训练数据集的均值
         image_std=args.image_std,  # 训练数据集的方差
@@ -160,13 +160,9 @@ def main(args):
         t_p.requires_grad = False
     if not args.t_model_checkpoint:
         raise ValueError('--t-model-checkpoint is required to load the teacher weights.')
-    checkpoint = torch.load(args.t_model_checkpoint, map_location='cpu')
-    """
-    ViT_B_16_cc3m_12m_ep32.pt使用sd = checkpoint["state_dict"]
-    ViT_B_16-laion400m_e32.pt使用sd = checkpoint
-    """
-    sd = checkpoint
-    sd = checkpoint["state_dict"]
+    checkpoint = torch.load(args.t_model_checkpoint, map_location='cpu', weights_only=True)
+    # 兼容两种发布格式：ViT_B_16_cc3m_12m_ep32.pt 为 {"state_dict": ...}，ViT_B_16-laion400m_e32.pt 为裸 state_dict
+    sd = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
     if next(iter(sd.items()))[0].startswith('module'):
         sd = {k[len('module.'):]: v for k, v in sd.items()}
     t_model.load_state_dict(sd)
@@ -175,10 +171,7 @@ def main(args):
     # 损失
     loss = KDClipLoss(
         args=args,
-        local_loss=args.local_loss,
-        gather_with_grad=args.gather_with_grad,
-        cache_labels=True,
-        use_horovod=args.horovod).to(args.device)
+        cache_labels=True).to(args.device)
 
     # create optimizer and scaler
     optimizer = None
@@ -202,25 +195,27 @@ def main(args):
         # 构造 AdamW 优化器，分成三组参数：
         #  1. gain_or_bias_params：weight_decay=0
         #  2. rest_params：weight_decay=args.wd
-        #  3. loss.parameters()：通常不希望对 loss module 的参数做 weight decay
+        #  3. loss.parameters()：不做 weight decay
         optimizer = optim.AdamW(
             [
                 {"params": gain_or_bias_params, "weight_decay": 0.},
                 {"params": rest_params, "weight_decay": args.wd},
-                {"params": loss.parameters()}
+                {"params": loss.parameters(), "weight_decay": 0.}
             ],
             lr=args.lr,
             betas=(args.beta1, args.beta2),
             eps=args.eps,
         )
         # 如果使用 AMP（混合精度），则启用 GradScaler 来自动动态调整梯度缩放，否则用 None
-        scaler = GradScaler() if args.precision == "amp" else None
+        # 只有在 CUDA 上使用 AMP 时才启用 GradScaler
+        use_amp = args.precision == "amp" and args.device.type == "cuda"
+        scaler = GradScaler("cuda", enabled=True) if use_amp else None
 
     # 设置训练轮次  （如果需要断点续训，则加载最新轮次的权重）
     start_epoch = 0
     if args.resume is not None:
         if os.path.isfile(args.resume):
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=True)
             if 'epoch' in checkpoint:
                 # resuming a train checkpoint w/ epoch and optimizer state
                 start_epoch = checkpoint["epoch"]

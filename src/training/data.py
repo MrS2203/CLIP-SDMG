@@ -20,13 +20,7 @@ from torch.utils.data.distributed import DistributedSampler
 from webdataset.filters import _shuffle
 from webdataset.tariterators import base_plus_ext, url_opener, tar_file_expander, valid_sample
 
-try:
-    import horovod.torch as hvd
-except ImportError:
-    hvd = None
-
 from .imagenet_zeroshot_data import openai_imagenet_template
-from .class_sampler import MPerClassSampler
 
 
 class CsvDataset(Dataset):
@@ -55,10 +49,9 @@ class CsvDataset(Dataset):
         img_path = os.path.join(self.root, str(self.images[idx]))
 
         try:
-            # 读取图像
-            image_file = Image.open(img_path)
-            # 图像预处理
-            images = self.transforms(image_file)
+            # 读取图像（使用上下文管理器确保文件句柄及时释放）
+            with Image.open(img_path) as image_file:
+                images = self.transforms(image_file)
             # 文本预处理
             texts = self.tokenize([str(self.captions[idx])])[0]
             return images, texts
@@ -105,7 +98,8 @@ class ImageNetCsvDataset(Dataset):
         definition = "The definition of %s is %s" % (self.class_name[idx], self.captions[idx])
         caption = self.imagenet_templates[np.random.choice(self.imagenet_templates_num)](
             self.class_name[idx]) + " " + definition
-        images = self.transforms(Image.open(str(img_path)))
+        with Image.open(str(img_path)) as image_file:
+            images = self.transforms(image_file)
         texts = self.tokenize([caption])[0]
         return images, texts
 
@@ -154,49 +148,6 @@ class RetrievalDataset(Dataset):
 
     def __len__(self):
         return len(self.img_keys)
-
-
-class MultiTaskDataLoader(object):
-    """
-    Multi-task DataLoader, the first dataloader is master dataloader
-    """
-
-    def __init__(self,
-                 loaders, seed=0):
-        assert len(loaders) > 1, "Less than 2 loader!"
-        self.loaders = loaders
-        self.iters = [iter(loader) for loader in loaders]
-        self.lens = [len(loader) for loader in loaders]
-        self.global_idx_in_cycle = 0
-        self.seed = seed
-
-    def __iter__(self):
-        if self.global_idx_in_cycle > 0:
-            self.iters[0] = iter(self.loaders[0])
-        return self
-
-    def __next__(self):
-        output_tuple = (*next(self.iters[0]),)
-        for k, (loader, _iter) in enumerate(zip(self.loaders[1:], self.iters[1:])):
-            try:
-                output_tuple += (*next(_iter),)
-            except StopIteration:
-                try:
-                    loader.batch_sampler.sampler.set_epoch(int(self.global_idx_in_cycle // self.lens[k + 1]))
-                except:
-                    pass
-                _iter = iter(loader)
-                self.iters[k + 1] = _iter
-                output_tuple += (*next(_iter),)
-
-        if self.global_idx_in_cycle < sys.maxsize - 1:
-            self.global_idx_in_cycle += 1
-        else:
-            self.global_idx_in_cycle = 0
-        return output_tuple
-
-    def __len__(self):
-        return self.lens[0]
 
 
 class SharedEpoch:
@@ -333,7 +284,7 @@ _SAMPLE_SHUFFLE_SIZE = 5000
 _SAMPLE_SHUFFLE_INITIAL = 1000
 
 
-class detshuffle2(wds.PipelineStage):
+class DetShuffle(wds.PipelineStage):
     def __init__(
             self,
             bufsize=1000,
@@ -430,7 +381,7 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
     if is_train:
         if not resampled:
             pipeline.extend([
-                detshuffle2(
+                DetShuffle(
                     bufsize=_SHARD_SHUFFLE_SIZE,
                     initial=_SHARD_SHUFFLE_INITIAL,
                     seed=args.seed,
@@ -492,101 +443,6 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
     dataloader.num_samples = num_samples
 
     return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch)
-
-
-def get_icar(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
-    input_filename = args.train_data if is_train else args.val_data
-    train_dataset_names = input_filename.split(',')
-    data_root_paths = args.data_root.split(',')
-    sup_dataset = ImageNetCsvDataset(
-        data_root_paths[0],
-        train_dataset_names[0],
-        preprocess_fn,
-        img_key=args.csv_img_key,
-        caption_key=args.csv_caption_key,
-        sep=args.csv_separator,
-        tokenizer=tokenizer)
-
-    vl_dataset = CsvDataset(
-        data_root_paths[1],
-        train_dataset_names[1],
-        preprocess_fn,
-        img_key=args.csv_img_key,
-        caption_key=args.csv_caption_key,
-        sep=args.csv_separator,
-        tokenizer=tokenizer)
-
-    sup_sampler = MPerClassSampler(labels=sup_dataset.labels,
-                                   m=args.num_per_class, batch_size=args.batch_size,
-                                   length_before_new_iter=len(sup_dataset.labels) // args.world_size)
-    vl_sampler = DistributedSampler(vl_dataset) if args.distributed and is_train else None
-
-    sup_dataloader = DataLoader(
-        sup_dataset,
-        batch_size=args.sup_batch_size,
-        num_workers=args.workers,
-        pin_memory=True,
-        sampler=sup_sampler,
-        drop_last=is_train,
-    )
-
-    vl_dataloader = DataLoader(
-        vl_dataset,
-        batch_size=args.vl_batch_size,
-        num_workers=args.workers,
-        pin_memory=True,
-        sampler=vl_sampler,
-        drop_last=is_train,
-    )
-
-    dataloader = MultiTaskDataLoader([sup_dataloader, vl_dataloader], seed=0)
-    dataloader.num_samples = len(vl_dataset) + len(sup_dataset)
-    dataloader.num_batches = len(dataloader)
-    return DataInfo(dataloader, sup_sampler)
-
-
-def get_vl_imagenet(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
-    input_filename = args.train_data
-    train_dataset_names = input_filename.split(',')
-    data_root_paths = args.data_root.split(',')
-
-    sup_dataset = datasets.ImageFolder(os.path.join(data_root_paths[0], 'train'),
-                                       transform=preprocess_fn)
-
-    sup_sampler = DistributedSampler(sup_dataset)
-    sup_dataloader = DataLoader(
-        sup_dataset,
-        batch_size=args.sup_batch_size,
-        num_workers=args.workers,
-        pin_memory=True,
-        sampler=sup_sampler,
-        drop_last=is_train,
-    )
-
-    vl_dataset = CsvDataset(
-        data_root_paths[1],
-        train_dataset_names[1],
-        preprocess_fn,
-        img_key=args.csv_img_key,
-        caption_key=args.csv_caption_key,
-        sep=args.csv_separator,
-        tokenizer=tokenizer)
-
-    vl_sampler = DistributedSampler(vl_dataset) if args.distributed and is_train else None
-
-    vl_dataloader = DataLoader(
-        vl_dataset,
-        batch_size=args.vl_batch_size,
-        num_workers=args.workers,
-        pin_memory=True,
-        sampler=vl_sampler,
-        drop_last=is_train,
-    )
-
-    sup_dataloader.num_samples = len(sup_dataset)
-    sup_dataloader.num_batches = len(sup_dataloader)
-    return DataInfo(sup_dataloader, sup_sampler), DataInfo(sup_dataloader, sup_sampler), DataInfo(vl_dataloader,
-                                                                                                  vl_sampler)
 
 
 # 自定义collate_fn函数，跳过返回None的batch
@@ -737,10 +593,6 @@ def get_synthetic_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None
 def get_dataset_fn(data_path, dataset_type):
     if dataset_type == "webdataset":
         return get_wds_dataset
-    elif dataset_type == 'icar':
-        return get_icar
-    elif dataset_type == "vl_imagenet":
-        return get_vl_imagenet
     elif dataset_type == "csv":
         if ',' in data_path:
             return get_csv_multi_dataset
@@ -764,15 +616,9 @@ def get_data(args, preprocess_fns, epoch=0, tokenizer=None):
     preprocess_train, preprocess_val = preprocess_fns
     data = {}
 
-    if args.train_data or args.dataset_type == "icar":
+    if args.train_data:
         data["train"] = get_dataset_fn(args.train_data, args.dataset_type)(
             args, preprocess_train, is_train=True, epoch=epoch, tokenizer=tokenizer)
-
-    if args.train_data and args.dataset_type == "vl_imagenet":
-        dataloader, sup_dataloader, vl_dataloader = get_dataset_fn(args.train_data, args.dataset_type)(
-            args, preprocess_train, is_train=True, epoch=epoch, tokenizer=tokenizer)
-        data["train"] = dataloader
-        data["train_loaders"] = (sup_dataloader, vl_dataloader)
 
     if args.val_data:
         data["val"] = get_dataset_fn(args.val_data, args.val_dataset_type)(

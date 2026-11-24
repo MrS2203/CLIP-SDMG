@@ -63,7 +63,7 @@ def parse_args(args):
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--wd", type=float, default=0.1, help="Weight decay.")
     parser.add_argument(
-        "--workers", type=int, default=1, help="Number of dataloader workers per GPU."
+        "--workers", type=int, default=4, help="Number of dataloader workers per GPU."
     )
     parser.add_argument(
         "--model",  # 学生模型
@@ -86,11 +86,11 @@ def parse_args(args):
     # FD
     parser.add_argument("--alpha_fd_loss", type=float, default=2000., help="FD_loss weight")
     # PGS
-    parser.add_argument("--alpha_pgs_loss", type=float, default=1., help="pgs_loss weight")
+    parser.add_argument("--alpha_pgs_loss", type=float, default=1., help="PGSLoss weight")
     # DAB
-    parser.add_argument("--alpha_dab_loss", type=float, default=1., help="dab_loss weight")
+    parser.add_argument("--alpha_dab_loss", type=float, default=1., help="DABLoss weight")
     # GEN
-    parser.add_argument("--alpha_gen_loss", type=float, default=1., help="gen_loss weight")
+    parser.add_argument("--alpha_gen_loss", type=float, default=1., help="GENLoss weight")
     parser.add_argument(
         "--tag",  # 实验标签
         type=str,
@@ -104,13 +104,6 @@ def parse_args(args):
         help="Number of samples in dataset. Required for webdataset if not available in info file.",
     )
     parser.add_argument(
-        "--num-per-class",
-        type=int,
-        default=1,
-        help="Number of samples per class",
-    )
-
-    parser.add_argument(
         "--val-num-samples",
         type=int,
         default=None,
@@ -119,21 +112,15 @@ def parse_args(args):
 
     parser.add_argument(
         "--dataset-type",
-        choices=["webdataset", "csv", "synthetic", "auto", "icar", "vl_imagenet"],
+        choices=["webdataset", "csv", "synthetic", "auto"],
         default="csv",
         help="Which type of dataset to process."
     )
     parser.add_argument(
         "--val-dataset-type",
-        choices=["webdataset", "csv", "synthetic", "auto", "icar"],
+        choices=["webdataset", "csv", "synthetic", "auto"],
         default="csv",
         help="Which type of val dataset to process."
-    )
-    parser.add_argument(
-        "--dataset-resampled",
-        default=False,
-        action="store_true",
-        help="Whether to use sampling with replacement for webdataset shard selection."
     )
     parser.add_argument(
         "--csv-separator",
@@ -196,25 +183,13 @@ def parse_args(args):
         default=None,
         help="Optional identifier for the experiment when storing logs. Otherwise use current time.",
     )
-    parser.add_argument(
-        "--sup-batch-size", type=int, default=64, help="Batch size per GPU."
-    )
-    parser.add_argument(
-        "--vl-batch-size", type=int, default=64, help="Batch size per GPU."
-    )
     parser.add_argument(  # 训练轮数
         "--epochs", type=int, default=32, help="Number of epochs to train for."
     )
     parser.add_argument("--beta1", type=float, default=None, help="Adam beta 1.")
     parser.add_argument("--beta2", type=float, default=None, help="Adam beta 2.")
     parser.add_argument("--eps", type=float, default=None, help="Adam epsilon.")
-    parser.add_argument("--alpha_cross_kd_loss", type=float, default=0., help="cross_kd_loss weight")
 
-    parser.add_argument(
-        "--use-bn-sync",
-        default=False,
-        action="store_true",
-        help="Whether to use batch norm sync.")
     parser.add_argument(
         "--skip-scheduler",
         action="store_true",
@@ -242,20 +217,8 @@ def parse_args(args):
         default="amp",
         help="Floating point precision."
     )
-    parser.add_argument(  # 模型加载路径（断点续训）
-        "--model-checkpoint",
-        type=str,
-        default="",
-        help="model checkpoint path",
-    )
     parser.add_argument(
         "--t-eval",
-        default=False,
-        action="store_true",
-        help="Whether to evaluate the pretrained teacher model"
-    )
-    parser.add_argument(
-        "--eval",
         default=False,
         action="store_true",
         help="Whether to evaluate the pretrained teacher model"
@@ -273,24 +236,6 @@ def parse_args(args):
         help="Load imagenet pretrained weights for image tower backbone if available.",
     )
     parser.add_argument(
-        "--lock-image",
-        default=False,
-        action='store_true',
-        help="Lock full image tower by disabling gradients.",
-    )
-    parser.add_argument(
-        "--lock-image-unlocked-groups",
-        type=int,
-        default=0,
-        help="Leave last n image tower layer groups unlocked.",
-    )
-    parser.add_argument(
-        "--lock-image-freeze-bn-stats",
-        default=False,
-        action='store_true',
-        help="Freeze BatchNorm running stats in image tower for any locked layers.",
-    )
-    parser.add_argument(
         '--image-mean', type=float, nargs='+', default=None, metavar='MEAN',
         help='Override default image mean value of dataset')
     parser.add_argument(
@@ -303,28 +248,10 @@ def parse_args(args):
         help="Enable gradient checkpointing.",
     )
     parser.add_argument(
-        "--local-loss",
-        default=False,
-        action="store_true",
-        help="calculate loss w/ local features @ global (instead of realizing full global @ global matrix)"
-    )
-    parser.add_argument(
-        "--gather-with-grad",
-        default=False,
-        action="store_true",
-        help="enable full distributed gradient for feature gather"
-    )
-    parser.add_argument(
         "--force-quick-gelu",
         default=False,
         action='store_true',
         help="Force use of QuickGELU activation for non-OpenAI transformer models.",
-    )
-    parser.add_argument(
-        "--force-custom-text",
-        default=False,
-        action='store_true',
-        help="Force use of CustomTextCLIP model (separate text-tower).",
     )
     parser.add_argument(
         "--torchscript",
@@ -337,16 +264,6 @@ def parse_args(args):
         default=False,
         action='store_true',
         help="torch.jit.trace the model for inference / eval only",
-    )
-    # arguments for distributed training
-    parser.add_argument(
-        "--dist-url",
-        default="env://",
-        type=str,
-        help="url used to set up distributed training",
-    )
-    parser.add_argument(
-        "--dist-backend", default="nccl", type=str, help="distributed backend"
     )
     parser.add_argument(
         "--wandb-notes",
@@ -361,28 +278,10 @@ def parse_args(args):
         help="If true, more information is logged."
     )
     parser.add_argument(
-        "--copy-codebase",
+        "--deterministic",
         default=False,
         action="store_true",
-        help="If true, we copy the entire base on the log diretory, and execute from there."
-    )
-    parser.add_argument(
-        "--horovod",
-        default=False,
-        action="store_true",
-        help="Use horovod for distributed training."
-    )
-    parser.add_argument(
-        "--ddp-static-graph",
-        default=False,
-        action='store_true',
-        help="Enable static graph optimization for DDP in PyTorch >= 1.11.",
-    )
-    parser.add_argument(
-        "--no-set-device-rank",
-        default=False,
-        action="store_true",
-        help="Don't set device index from local rank (when CUDA_VISIBLE_DEVICES restricted to one per proc)."
+        help="Enable deterministic cuDNN behavior (disables cudnn.benchmark)."
     )
     parser.add_argument(
         "--seed", type=int, default=0, help="Default random seed."

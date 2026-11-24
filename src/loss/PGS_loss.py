@@ -11,18 +11,18 @@ from .common import (
 )
 
 
-class pgs_loss(nn.Module):
+class PGSLoss(nn.Module):
     def __init__(self, args):
-        super(pgs_loss, self).__init__()
+        super(PGSLoss, self).__init__()
         self.model_name = args.model
 
         for layer in DISTILL_LAYERS:
             # 视觉/文本的维度对齐层
-            setattr(self, f'visual_proj_{layer}', EmbTrans(args))
-            setattr(self, f'text_proj_{layer}', txt_EmbTrans(args))
+            setattr(self, f'visual_proj_{layer}', VisualAligner(args))
+            setattr(self, f'text_proj_{layer}', TextAligner(args))
             # 每个层各一组视觉/文本蒸馏损失
-            setattr(self, f'v_loss_{layer}', loss(layer))
-            setattr(self, f't_loss_{layer}', loss(layer))
+            setattr(self, f'v_loss_{layer}', LayerAlignmentLoss(layer))
+            setattr(self, f't_loss_{layer}', LayerAlignmentLoss(layer))
 
         # 子模块以原属性名注册，保持 checkpoint 兼容；这里只建立便于遍历的引用
         self.visual_projs = [getattr(self, f'visual_proj_{layer}') for layer in DISTILL_LAYERS]
@@ -49,11 +49,11 @@ class pgs_loss(nn.Module):
         return vision_loss + text_loss
 
 
-class EmbTrans(nn.Module):
+class VisualAligner(nn.Module):
     """视觉特征到教师维度的对齐（BatchNorm + Dropout + Linear）。"""
 
     def __init__(self, args):
-        super(EmbTrans, self).__init__()
+        super(VisualAligner, self).__init__()
         self.model_name = args.model
 
         dims = get_student_dims(args.model)
@@ -81,11 +81,11 @@ class EmbTrans(nn.Module):
         return self.fc1(x) if self.fc1 is not None else x
 
 
-class txt_EmbTrans(nn.Module):
+class TextAligner(nn.Module):
     """文本特征到教师文本维度的对齐（LayerNorm + Dropout [+ Linear]）。"""
 
     def __init__(self, args):
-        super(txt_EmbTrans, self).__init__()
+        super(TextAligner, self).__init__()
         self.model_name = args.model
 
         dims = get_student_dims(args.model)
@@ -112,33 +112,26 @@ class txt_EmbTrans(nn.Module):
         return self.fc1(x) if self.fc1 is not None else x
 
 
-class loss(nn.Module):
+class LayerAlignmentLoss(nn.Module):
     """单层特征的方向 + L2 蒸馏损失，浅层更侧重方向一致性。"""
 
     def __init__(self, layer=0):  # 层数默认为0
-        super(loss, self).__init__()
+        super(LayerAlignmentLoss, self).__init__()
         self.layer = layer
         # 线性衰减：越靠近输入层，角度损失的权重越大
         self.distance_weight = 1.0 - layer / (TOTAL_LAYERS - 1)
 
     def project(self, s_emb, t_emb):
         assert s_emb.size() == t_emb.size()
-        angle_loss = 0.0
-        distance_loss = 0.0
+        # 批量计算方向相似性损失与 L2 距离损失（shape: [B]）
+        s_norm = F.normalize(s_emb, p=2, dim=-1)
+        t_norm = F.normalize(t_emb, p=2, dim=-1)
+        angle_loss = 1 - (s_norm * t_norm).sum(dim=-1)
+        distance_loss = F.mse_loss(s_emb, t_emb, reduction='none').mean(dim=-1)
 
-        for s, t in zip(s_emb, t_emb):
-            # 归一化学生和教师特征
-            s_norm = s / s.norm(p=2)
-            t_norm = t / t.norm(p=2)
-            # 计算方向相似性损失
-            angle_loss += 1 - torch.dot(s_norm, t_norm)
-            # 计算L2距离损失
-            distance_loss += F.mse_loss(s, t)
-
-        # 组合损失，按权重加权
+        # 组合损失，按权重加权后对 batch 求平均
         return (angle_loss * (1 - self.distance_weight) +
-                distance_loss * self.distance_weight)
+                distance_loss * self.distance_weight).mean()
 
     def forward(self, s_emb, t_emb):
-        nd_loss = self.project(s_emb=s_emb, t_emb=t_emb)
-        return nd_loss / len(s_emb)  # 返回平均损失
+        return self.project(s_emb=s_emb, t_emb=t_emb)  # 返回 batch 平均损失

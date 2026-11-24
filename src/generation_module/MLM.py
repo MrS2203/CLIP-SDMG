@@ -31,20 +31,17 @@ class MultiHeadAttention(nn.Module):
         """
         根据 encode_length 构造 attention mask.
         Args:
-            encode_length: int，当前样本的有效长度
-            max_len: int，编码器输出的序列总长度（例如77）
+            encode_length: 标量或 [B] 的有效长度
+            max_len: 编码器输出的序列总长度（例如77）
             device: torch.device
 
         Returns:
-            mask: [1, 1, 1, max_len] 的张量，1表示可见，0表示mask掉
+            mask: [B, 1, 1, max_len] 或 [1, 1, 1, max_len]，1 表示可见，0 表示 mask 掉
         """
-        # 初始化全1，表示所有位置可见
-        mask = torch.ones(max_len, device=device)
-        # 把超出 encode_length 的部分置0
-        mask[encode_length:] = 0
-        # 扩展到 [1,1,1,max_len]，能和 scores = [B,h,L,Lk] 对齐
-        mask = mask.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-        return mask
+        encode_length = torch.as_tensor(encode_length, device=device)
+        positions = torch.arange(max_len, device=device)
+        mask = (positions.view(1, -1) < encode_length.view(-1, 1)).float()
+        return mask.view(encode_length.numel(), 1, 1, max_len)
 
     def forward(self, query, key, value, len=None):
         B, L, _ = query.size()
@@ -266,25 +263,32 @@ class MLM(nn.Module):
             return logit[:, :max_len, :]
 
     def forward(self, encode_output, encode_length):
-        # encode_length 以0为起始
-        # 解码器的输出以目标长度为标准
         # encode_output.shape [batch, context_length, d_model]
-        # 第一层for循环是遍历批次
+        # encode_length [batch] 以0为起始的有效长度
+        # 以“解码步”为单位批量化，避免逐样本、逐 token 的串行调用
+        batch_size = encode_output.shape[0]
+        vocab_size = self.decoder.lm_head.out_features
+        if batch_size == 0:
+            return encode_output.new_zeros((0, self.max_logits_len, vocab_size))
+
+        max_steps = int(encode_length.max().item())
+        # 初始化编码器的 state（encode_length 为 [B]，由掩码按样本生效）
+        state = self.decoder.init_state(encode_output, encode_length)
+        next_tokens = torch.full(
+            (batch_size,), BOS_TOKEN_ID, dtype=torch.long, device=encode_output.device)
         logits = []
-        for i in range(encode_output.shape[0]):
-            # 初始化编码器的sate
-            state = self.decoder.init_state(encode_output[i], encode_length[i])
-            seq = [BOS_TOKEN_ID]
-            logit = []
-            # 第二层for循环是遍历批次中的每个样本的长度
-            for j in range(encode_length[i]):
-                current_token = torch.tensor([seq[-1]], device=encode_output.device)  # [1]
-                next_token_logits = self.decoder(current_token, state, j)  # [1, 1, vocab_size]
-                logit.append(next_token_logits)
-                next_token = next_token_logits[:, -1, :].argmax(dim=-1).item()
-                seq.append(next_token)  # [1, len]
-            logit = torch.cat(logit, dim=1)  # [B, L-1, vocab_size] 本身不包含<bos>
-            logit = self.pad_logits(logit, self.max_logits_len)
-            logits.append(logit)
-        logits = torch.cat(logits, dim=0)
-        return logits
+        for step in range(max_steps):
+            step_logits = self.decoder(next_tokens, state, step)  # [B, 1, vocab_size]
+            logits.append(step_logits)
+            next_tokens = step_logits[:, -1, :].argmax(dim=-1)
+
+        if logits:
+            logits = torch.cat(logits, dim=1)  # [B, max_steps, vocab_size]
+            # 超过各样本有效长度的位置置零，与逐样本实现的输出保持一致
+            valid = torch.arange(max_steps, device=encode_output.device).unsqueeze(0) < \
+                encode_length.unsqueeze(1)
+            logits = logits.masked_fill(~valid.unsqueeze(-1), 0.0)
+        else:
+            logits = encode_output.new_zeros((batch_size, 0, vocab_size))
+
+        return self.pad_logits(logits, self.max_logits_len)
