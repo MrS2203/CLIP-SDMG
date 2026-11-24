@@ -89,7 +89,6 @@ def zero_shot_eval(model, data, epoch, args):
 
     logging.info('Building zero-shot classifier')
     classifier = zero_shot_classifier(model, imagenet_classnames, openai_imagenet_template, args)
-    print(classifier.shape)
 
     logging.info('Using classifier')
     results = {}

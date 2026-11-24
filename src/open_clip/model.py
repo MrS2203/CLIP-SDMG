@@ -338,7 +338,7 @@ def build_model_from_openai_state_dict(
     vocab_size = state_dict["token_embedding.weight"].shape[0]
     transformer_width = state_dict["ln_final.weight"].shape[0]
     transformer_heads = transformer_width // 64
-    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
+    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
 
     vision_cfg = CLIPVisionCfg(
         layers=vision_layers,
@@ -397,7 +397,7 @@ def interpolate_pos_embed(model, checkpoint_model):
         new_size = int(num_patches ** 0.5)
         # class_token and dist_token are kept unchanged
         if orig_size != new_size:
-            print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
+            logging.info("Position interpolate from %dx%d to %dx%d", orig_size, orig_size, new_size, new_size)
             extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
             # only the position tokens are interpolated
             pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]

@@ -1,9 +1,7 @@
+import numpy as np
 import torch
 from torch.utils.data.sampler import Sampler
-
-import sys
-import os
-from . import common_functions as c_f
+from collections import defaultdict
 
 
 # modified from
@@ -20,7 +18,7 @@ class MPerClassSampler(Sampler):
             labels = labels.numpy()
         self.m_per_class = int(m)
         self.batch_size = int(batch_size) if batch_size is not None else batch_size
-        self.labels_to_indices = c_f.get_labels_to_indices(labels)
+        self.labels_to_indices = get_labels_to_indices(labels)
         self.labels = list(self.labels_to_indices.keys())
 
         self.length_of_single_pass = self.m_per_class * len(self.labels)
@@ -46,14 +44,14 @@ class MPerClassSampler(Sampler):
         i = 0
         num_iters = self.calculate_num_iters()
         for _ in range(num_iters):
-            c_f.NUMPY_RANDOM.shuffle(self.labels)
+            np.random.shuffle(self.labels)
             if self.batch_size is None:
                 curr_label_set = self.labels
             else:
                 curr_label_set = self.labels[: self.batch_size // self.m_per_class]
             for label in curr_label_set:
                 t = self.labels_to_indices[label]
-                idx_list[i : i + self.m_per_class] = c_f.safe_random_choice(
+                idx_list[i : i + self.m_per_class] = safe_random_choice(
                     t, size=self.m_per_class
                 )
                 i += self.m_per_class
@@ -64,3 +62,21 @@ class MPerClassSampler(Sampler):
             self.length_of_single_pass if self.batch_size is None else self.batch_size
         )
         return self.list_size // divisor if divisor < self.list_size else 1
+
+
+def get_labels_to_indices(labels):
+    """把每个类别标签映射到它对应的样本下标数组。"""
+    if torch.is_tensor(labels):
+        labels = labels.cpu().numpy()
+    labels_to_indices = defaultdict(list)
+    for i, label in enumerate(labels):
+        labels_to_indices[label].append(i)
+    for k, v in labels_to_indices.items():
+        labels_to_indices[k] = np.array(v, dtype=np.int64)
+    return labels_to_indices
+
+
+def safe_random_choice(input_data, size):
+    """无放回随机采样；样本数不足 size 时退化为有放回采样。"""
+    replace = len(input_data) < size
+    return np.random.choice(input_data, size=size, replace=replace)

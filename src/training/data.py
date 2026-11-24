@@ -5,7 +5,6 @@ import math
 import os
 import random
 import sys
-import time
 from dataclasses import dataclass
 from multiprocessing import Value
 
@@ -16,7 +15,7 @@ import torch
 import torchvision.datasets as datasets
 import webdataset as wds
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, IterableDataset, get_worker_info
+from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
 from torch.utils.data.distributed import DistributedSampler
 from webdataset.filters import _shuffle
 from webdataset.tariterators import base_plus_ext, url_opener, tar_file_expander, valid_sample
@@ -26,35 +25,9 @@ try:
 except ImportError:
     hvd = None
 
-from src.open_clip import tokenize
-from src.open_clip.tokenizer import HFTokenizer
 from .imagenet_zeroshot_data import openai_imagenet_template
 from .class_sampler import MPerClassSampler
 
-
-# class CsvDataset(Dataset):
-#     def __init__(self, data_root, input_filename, transforms, img_key, caption_key, sep="\t", tokenizer=None):
-#         logging.debug(f'Loading csv data from {input_filename}.')
-#         df = pd.read_csv(input_filename, sep=sep)
-#
-#         self.images = df[img_key].tolist()
-#         self.captions = df[caption_key].tolist()
-#         self.transforms = transforms
-#         self.root = data_root
-#
-#         logging.debug('Done loading data.')
-#
-#         self.tokenize = tokenizer
-#
-#     def __len__(self):
-#         return len(self.captions)
-#
-#     def __getitem__(self, idx):
-#         img_path = os.path.join(self.root, str(self.images[idx]))
-#         image_file = Image.open(img_path)
-#         images = self.transforms(image_file)
-#         texts = self.tokenize([str(self.captions[idx])])[0]
-#         return images, texts
 
 class CsvDataset(Dataset):
     def __init__(self, data_root, input_filename, transforms, img_key, caption_key, sep="\t", tokenizer=None):
@@ -65,13 +38,13 @@ class CsvDataset(Dataset):
         img_key filepath
         caption_key title
         """
-        logging.debug(f'从{input_filename}加载CSV数据.')
+        logging.debug(f'Loading csv data from {input_filename}.')
         df = pd.read_csv(input_filename, sep=sep)
         self.images = df[img_key].tolist()  # 将图像路径转换为列表形式
         self.captions = df[caption_key].tolist()  # 将文本转换为列表形式
         self.transforms = transforms
         self.root = data_root
-        logging.debug('加载数据ing')
+        logging.debug('Done loading data.')
         self.tokenize = tokenizer
 
     def __len__(self):
@@ -93,8 +66,6 @@ class CsvDataset(Dataset):
         except (OSError, IOError) as e:
             # 输出错误日志并跳过该图像
             logging.error(f"Error loading image {img_path}: {e}")
-            logging.info(f"出错图像路径 {img_path}: {e}")
-            print(f"Skipping batch due to error: {e}")
             return None
 
 
@@ -516,20 +487,6 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
         persistent_workers=True,
     )
 
-    # FIXME not clear which approach is better, with_epoch before vs after dataloader?
-    # hoping to resolve via https://github.com/webdataset/webdataset/issues/169
-    # if is_train:
-    #     # roll over and repeat a few samples to get same number of full batches on each node
-    #     global_batch_size = args.batch_size * args.world_size
-    #     num_batches = math.ceil(num_samples / global_batch_size)
-    #     num_workers = max(1, args.workers)
-    #     num_batches = math.ceil(num_batches / num_workers) * num_workers
-    #     num_samples = num_batches * global_batch_size
-    #     dataloader = dataloader.with_epoch(num_batches)
-    # else:
-    #     # last batches are partial, eval is done on single (master) node
-    #     num_batches = math.ceil(num_samples / args.batch_size)
-
     # add meta-data to dataloader instance for convenience
     dataloader.num_batches = num_batches
     dataloader.num_samples = num_samples
@@ -540,7 +497,6 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
 def get_icar(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     input_filename = args.train_data if is_train else args.val_data
     train_dataset_names = input_filename.split(',')
-    train_datasets = []
     data_root_paths = args.data_root.split(',')
     sup_dataset = ImageNetCsvDataset(
         data_root_paths[0],
@@ -560,11 +516,9 @@ def get_icar(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
         sep=args.csv_separator,
         tokenizer=tokenizer)
 
-    num_samples = len(vl_dataset) + len(sup_dataset)
     sup_sampler = MPerClassSampler(labels=sup_dataset.labels,
                                    m=args.num_per_class, batch_size=args.batch_size,
                                    length_before_new_iter=len(sup_dataset.labels) // args.world_size)
-    # sup_sampler = DistributedSampler(sup_dataset) if args.distributed and is_train else None
     vl_sampler = DistributedSampler(vl_dataset) if args.distributed and is_train else None
 
     sup_dataloader = DataLoader(
@@ -594,7 +548,6 @@ def get_icar(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
 def get_vl_imagenet(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     input_filename = args.train_data
     train_dataset_names = input_filename.split(',')
-    train_datasets = []
     data_root_paths = args.data_root.split(',')
 
     sup_dataset = datasets.ImageFolder(os.path.join(data_root_paths[0], 'train'),

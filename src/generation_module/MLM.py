@@ -3,6 +3,13 @@ import math
 import torch.nn as nn
 import torch.nn.functional as F
 
+# CLIP BPE 词表中的 <start_of_text> token
+BOS_TOKEN_ID = 49406
+# 文本生成解码器的层数
+DECODER_LAYERS = 2
+# 与 CLIP 约定保持一致：每个 head 的维度固定为 64
+HEAD_DIM = 64
+
 
 # === 多头注意力（带 mask）===
 class MultiHeadAttention(nn.Module):
@@ -50,7 +57,8 @@ class MultiHeadAttention(nn.Module):
         # 注意力分数
         scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.d_k ** 0.5)  # [B, h, L, L_k]
         if len is not None:
-            mask = self.build_encoder_mask(len + 1, 77, scores.device)
+            # mask 长度与 key 的序列长度保持一致，避免写死上下文长度
+            mask = self.build_encoder_mask(len + 1, K.shape[2], scores.device)
             scores = scores.masked_fill(mask == 0, float('-inf'))
 
         attn = F.softmax(scores, dim=-1)
@@ -177,10 +185,10 @@ class DecoderBlock(nn.Module):
 
 # === 整个解码器 ===
 class TransformerDecoder(nn.Module):
-    def __init__(self, vocab_size, d_model=512, num_layers=2, num_heads=8, dropout=0.1):
+    def __init__(self, vocab_size, d_model=512, num_layers=2, num_heads=8, dropout=0.1, context_length=77):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoding = PositionalEncoding(d_model, dropout=dropout)
+        self.pos_encoding = PositionalEncoding(d_model, dropout=dropout, max_len=context_length)
         self.num_layers = num_layers
         self.layers = nn.ModuleList([
             DecoderBlock(d_model, num_heads, dropout, i)
@@ -208,11 +216,16 @@ class MLM(nn.Module):
     def __init__(self, args):
         super(MLM, self).__init__()
         self.args = args
+        # 解码器维度必须与学生文本编码器一致（ViT-S/T-16 为 384，ViT-M-16 为 512）
+        d_model = args.token_txt
+        num_heads = max(1, d_model // HEAD_DIM)
+        self.max_logits_len = args.s_context_length - 1
         self.decoder = TransformerDecoder(
-            vocab_size=49408,
-            d_model=384,
-            num_layers=2,
-            num_heads=6)
+            vocab_size=args.s_vocab_size,
+            d_model=d_model,
+            num_layers=DECODER_LAYERS,
+            num_heads=num_heads,
+            context_length=args.s_context_length)
         self.decoder.apply(self.xavier_init_weights)
 
     @staticmethod
@@ -255,13 +268,13 @@ class MLM(nn.Module):
     def forward(self, encode_output, encode_length):
         # encode_length 以0为起始
         # 解码器的输出以目标长度为标准
-        # encode_output.shape [batch, 77, 384]
+        # encode_output.shape [batch, context_length, d_model]
         # 第一层for循环是遍历批次
         logits = []
         for i in range(encode_output.shape[0]):
             # 初始化编码器的sate
             state = self.decoder.init_state(encode_output[i], encode_length[i])
-            seq = [49406]
+            seq = [BOS_TOKEN_ID]
             logit = []
             # 第二层for循环是遍历批次中的每个样本的长度
             for j in range(encode_length[i]):
@@ -271,7 +284,7 @@ class MLM(nn.Module):
                 next_token = next_token_logits[:, -1, :].argmax(dim=-1).item()
                 seq.append(next_token)  # [1, len]
             logit = torch.cat(logit, dim=1)  # [B, L-1, vocab_size] 本身不包含<bos>
-            logit = self.pad_logits(logit)
+            logit = self.pad_logits(logit, self.max_logits_len)
             logits.append(logit)
         logits = torch.cat(logits, dim=0)
         return logits

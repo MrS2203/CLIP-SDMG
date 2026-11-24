@@ -9,20 +9,6 @@ from src.loss.DAB_loss import dab_loss
 from src.loss.GEN_loss import gen_loss
 
 
-try:
-    import torch.distributed.nn
-    from torch import distributed as dist
-
-    has_distributed = True
-except ImportError:
-    has_distributed = False
-
-try:
-    import horovod.torch as hvd
-except ImportError:
-    hvd = None
-
-
 class ClipLoss(nn.Module):
 
     def __init__(
@@ -70,20 +56,6 @@ class ClipLoss(nn.Module):
         return total_loss
 
 
-class DistillKL(nn.Module):
-    """Distilling the Knowledge in a Neural Network"""
-
-    def __init__(self, T):
-        super(DistillKL, self).__init__()
-        self.T = T
-
-    def forward(self, y_s, y_t):
-        p_s = F.log_softmax(y_s / self.T, dim=1)
-        p_t = F.softmax(y_t / self.T, dim=1)
-        loss = F.kl_div(p_s, p_t, reduction='batchmean') * (self.T ** 2)
-        return loss
-
-
 class KDClipLoss(nn.Module):
 
     def __init__(
@@ -112,7 +84,6 @@ class KDClipLoss(nn.Module):
 
         # cache state
         self.prev_num_logits = 0
-        self.kl_loss = DistillKL(T=1)
         self.cross_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.fusion_logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.labels = {}
@@ -163,11 +134,11 @@ class KDClipLoss(nn.Module):
         task_loss = (F.cross_entropy(logits_per_image, labels) + F.cross_entropy(logits_per_text, labels)) / 2
 
         # 渐进式全局语义蒸馏损失
-        pgs_loss = torch.tensor(0.).cuda()
+        pgs_loss = torch.zeros((), device=device)
         # 基于注意权重的浅层模仿
-        dab_loss = torch.tensor(0.).cuda()
+        dab_loss = torch.zeros((), device=device)
         # 深层掩码生成
-        gen_loss = torch.tensor(0.).cuda()
+        gen_loss = torch.zeros((), device=device)
 
         if self.args.alpha_pgs_loss > 0.:
             pgs_loss = self.pgs_loss(intermediate_features, t_intermediate_features,

@@ -13,7 +13,7 @@ try:
 except ImportError:
     wandb = None
 
-from src.open_clip import ClipLoss, KDClipLoss, get_cast_dtype
+from src.open_clip import get_cast_dtype
 from src.training.zero_shot import zero_shot_eval
 from src.training.precision import get_autocast
 
@@ -42,138 +42,6 @@ def unwrap_model(model):
         return model.module
     else:
         return model
-
-
-def train_one_epoch(model, data, epoch, optimizer, scaler, scheduler, args, tb_writer=None):
-    device = torch.device(args.device)
-    autocast = get_autocast(args.precision)
-    cast_dtype = get_cast_dtype(args.precision)
-
-    # 训练模型
-    model.train()
-    loss = ClipLoss(
-        local_loss=args.local_loss,
-        gather_with_grad=args.gather_with_grad,
-        cache_labels=True,
-    )
-
-    data['train'].set_epoch(epoch)  # set epoch in process safe manner via sampler or shared_epoch
-    dataloader = data['train'].dataloader
-    num_batches_per_epoch = dataloader.num_batches
-    sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
-
-    loss_m = AverageMeter()
-    batch_time_m = AverageMeter()
-    data_time_m = AverageMeter()  # 加载数据时间
-    end = time.time()
-    for i, batch in enumerate(dataloader):
-        step = num_batches_per_epoch * epoch + i
-
-        if not args.skip_scheduler:
-            # 学习率衰减
-            scheduler(step)
-
-        # images [B,C,H,W]
-        # texts [B, 文本长度(77)]
-        images, texts = batch
-        images = images.to(device=device, dtype=cast_dtype, non_blocking=True)
-        texts = texts.to(device=device, non_blocking=True)
-
-        data_time_m.update(time.time() - end)
-        # 每个Batch_size梯度归零
-        optimizer.zero_grad()
-
-        with autocast():
-            """
-            image_features [B, 嵌入维度]
-            text_features [B, 嵌入维度]
-            logit_scale 缩放因子(可学习)
-            """
-            image_features, _, text_features, _, logit_scale = model(images, texts)
-            # CLIP经典损失
-            total_loss = loss(image_features, text_features, logit_scale)
-
-        # 是否使用梯度缩放
-        if scaler is not None:
-            # 使用AMP进行损失缩放并反向传播
-            scaler.scale(total_loss).backward()
-
-            # 如果设置了梯度裁剪, 先取消缩放再裁剪梯度
-            if args.grad_clip_norm is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
-
-            # 使用AMP进行优化器更新
-            scaler.step(optimizer)
-
-            # 更新梯度缩放器，准备下一轮训练
-            scaler.update()
-        else:
-            # 不使用AMP，直接反向传播
-            total_loss.backward()
-
-            # 如果设置了梯度裁剪，进行裁剪
-            if args.grad_clip_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
-
-            # 优化器更新
-            optimizer.step()
-
-        # Note: we clamp to 4.6052 = ln(100), as in the original paper.
-        with torch.no_grad():
-            unwrap_model(model).logit_scale.clamp_(0, math.log(100))
-
-        # 查看梯度
-        for name, param in model.named_parameters():
-            if param.grad is None:
-                print(f"Grad for {name}: {param.grad}")
-
-        # 处理一个Batch的时间
-        batch_time_m.update(time.time() - end)
-        end = time.time()
-        batch_count = i + 1
-        if (i % 5 == 0 or batch_count == num_batches_per_epoch):
-            batch_size = len(images)
-            num_samples = batch_count * batch_size
-            samples_per_epoch = dataloader.num_samples
-            percent_complete = 100.0 * batch_count / num_batches_per_epoch
-
-            # NOTE loss is coarsely sampled, just master node and per log update
-            loss_m.update(total_loss.item(), batch_size)
-            logit_scale_scalar = logit_scale.item()
-
-            # 获取显存情况
-            current_memory_allocated = torch.cuda.memory_allocated() / (1024 ** 3)  # GB
-            current_memory_reserved = torch.cuda.memory_reserved() / (1024 ** 3)  # GB
-
-            logging.info(
-                f"Train Epoch: {epoch} [{num_samples:>{sample_digits}}/{samples_per_epoch} ({percent_complete:.0f}%)] "
-                f"Loss: {loss_m.val:#.5g} ({loss_m.avg:#.4g}) "
-                f"Data (t): {data_time_m.avg:.3f} "
-                f"Batch (t): {batch_time_m.avg:.3f}, {args.batch_size / batch_time_m.val:#g}/s "
-                f"lr: {optimizer.param_groups[0]['lr']:5f} "
-                f"Logit Scale: {logit_scale_scalar:.3f}"
-                f"Memory Allocated: {current_memory_allocated:.2f} GB "
-                f"Memory Reserved: {current_memory_reserved:.2f} GB"
-            )
-
-            # Save train loss / etc. Using non avg meter values as loggers have their own smoothing
-            log_data = {
-                "loss": loss_m.val,
-                "data_time": data_time_m.val,
-                "batch_time": batch_time_m.val,
-                "samples_per_scond": args.batch_size / batch_time_m.val,
-                "scale": logit_scale_scalar,
-                "lr": optimizer.param_groups[0]["lr"]
-            }
-            for name, val in log_data.items():
-                name = "train/" + name
-                if tb_writer is not None:
-                    tb_writer.add_scalar(name, val, step)
-
-            # resetting batch / data time meters per log window
-            batch_time_m.reset()
-            data_time_m.reset()
 
 
 def train_kd_one_epoch(model, t_model, data, epoch, loss, optimizer, scaler, scheduler, args, tb_writer=None):
@@ -314,7 +182,7 @@ def train_kd_one_epoch(model, t_model, data, epoch, loss, optimizer, scaler, sch
                 "loss": loss_m.val,
                 "data_time": data_time_m.val,
                 "batch_time": batch_time_m.val,
-                "samples_per_scond": args.batch_size / batch_time_m.val,
+                "samples_per_second": args.batch_size / batch_time_m.val,
                 "scale": logit_scale_scalar,
                 "lr": optimizer.param_groups[0]["lr"]
             }

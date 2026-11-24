@@ -1,7 +1,14 @@
 import torch
-import math
 from torch import nn
 from torch.nn import functional as F
+
+from .common import (
+    DISTILL_LAYERS,
+    TEACHER_TEXT_DIM,
+    TEACHER_VISION_DIM,
+    TOTAL_LAYERS,
+    get_student_dims,
+)
 
 
 class pgs_loss(nn.Module):
@@ -9,108 +16,60 @@ class pgs_loss(nn.Module):
         super(pgs_loss, self).__init__()
         self.model_name = args.model
 
-        # 视觉维度对齐
-        self.visual_proj_0 = EmbTrans(args)
-        self.visual_proj_1 = EmbTrans(args)
-        self.visual_proj_6 = EmbTrans(args)
-        self.visual_proj_11 = EmbTrans(args)
-        # 文本维度对齐
-        self.text_proj_0 = txt_EmbTrans(args)
-        self.text_proj_1 = txt_EmbTrans(args)
-        self.text_proj_6 = txt_EmbTrans(args)
-        self.text_proj_11 = txt_EmbTrans(args)
+        for layer in DISTILL_LAYERS:
+            # 视觉/文本的维度对齐层
+            setattr(self, f'visual_proj_{layer}', EmbTrans(args))
+            setattr(self, f'text_proj_{layer}', txt_EmbTrans(args))
+            # 每个层各一组视觉/文本蒸馏损失
+            setattr(self, f'v_loss_{layer}', loss(layer))
+            setattr(self, f't_loss_{layer}', loss(layer))
 
-        # 损失函数
-        self.v_loss_0 = loss(0)
-        self.v_loss_1 = loss(1)
-        self.v_loss_6 = loss(6)
-        self.v_loss_11 = loss(11)
-
-        self.t_loss_0 = loss(0)
-        self.t_loss_1 = loss(1)
-        self.t_loss_6 = loss(6)
-        self.t_loss_11 = loss(11)
+        # 子模块以原属性名注册，保持 checkpoint 兼容；这里只建立便于遍历的引用
+        self.visual_projs = [getattr(self, f'visual_proj_{layer}') for layer in DISTILL_LAYERS]
+        self.text_projs = [getattr(self, f'text_proj_{layer}') for layer in DISTILL_LAYERS]
+        self.v_losses = [getattr(self, f'v_loss_{layer}') for layer in DISTILL_LAYERS]
+        self.t_losses = [getattr(self, f't_loss_{layer}') for layer in DISTILL_LAYERS]
 
     def forward(self, intermediate_features, t_intermediate_features,
                 txt_intermediate_features, t_txt_intermediate_features, texts):
-        pgs_loss = torch.tensor(0.).cuda()
         # 1. 维度对齐
-        # 视觉
-        cls_tokens = [
-            self.visual_proj_0(intermediate_features[0][:, 0, :]),
-            self.visual_proj_1(intermediate_features[1][:, 0, :]),
-            self.visual_proj_6(intermediate_features[6][:, 0, :]),
-            self.visual_proj_11(intermediate_features[11][:, 0, :])]
-        t_cls_tokens = [t_intermediate_features[0][:, 0, :],
-                        t_intermediate_features[1][:, 0, :],
-                        t_intermediate_features[6][:, 0, :],
-                        t_intermediate_features[11][:, 0, :]]
-
-        # 文本
+        eot_index = texts.argmax(dim=-1)  # 每段文本的 <end_of_text> 位置
         indexs = torch.arange(txt_intermediate_features[0].shape[0])
-        end_tokens = [txt_intermediate_features[0][indexs, texts.argmax(dim=-1)],
-                      txt_intermediate_features[1][indexs, texts.argmax(dim=-1)],
-                      txt_intermediate_features[6][indexs, texts.argmax(dim=-1)],
-                      txt_intermediate_features[11][indexs, texts.argmax(dim=-1)]]
-        # 隐射层
-        end_tokens = [self.text_proj_0(end_tokens[0]),
-                      self.text_proj_1(end_tokens[1]),
-                      self.text_proj_6(end_tokens[2]),
-                      self.text_proj_11(end_tokens[3])]
-        t_end_tokens = [
-            t_txt_intermediate_features[0][indexs, texts.argmax(dim=-1)],
-            t_txt_intermediate_features[1][indexs, texts.argmax(dim=-1)],
-            t_txt_intermediate_features[6][indexs, texts.argmax(dim=-1)],
-            t_txt_intermediate_features[11][indexs, texts.argmax(dim=-1)]
-        ]
-        # 计算损失
-        # 视觉
-        pgs_loss = self.v_loss_0(cls_tokens[0], t_cls_tokens[0]) + \
-                   self.v_loss_1(cls_tokens[1], t_cls_tokens[1]) + \
-                   self.v_loss_6(cls_tokens[2], t_cls_tokens[2]) + \
-                   self.v_loss_11(cls_tokens[3], t_cls_tokens[3]) + \
-                   self.t_loss_0(end_tokens[0], t_end_tokens[0]) + \
-                   self.t_loss_1(end_tokens[1], t_end_tokens[1]) + \
-                   self.t_loss_6(end_tokens[2], t_end_tokens[2]) + \
-                   self.t_loss_11(end_tokens[3], t_end_tokens[3])
 
-        return pgs_loss
+        cls_tokens = [proj(intermediate_features[layer][:, 0, :])
+                      for proj, layer in zip(self.visual_projs, DISTILL_LAYERS)]
+        t_cls_tokens = [t_intermediate_features[layer][:, 0, :] for layer in DISTILL_LAYERS]
+        end_tokens = [proj(txt_intermediate_features[layer][indexs, eot_index])
+                      for proj, layer in zip(self.text_projs, DISTILL_LAYERS)]
+        t_end_tokens = [t_txt_intermediate_features[layer][indexs, eot_index] for layer in DISTILL_LAYERS]
+
+        # 2. 计算损失
+        vision_loss = sum(loss_fn(s, t) for loss_fn, s, t in zip(self.v_losses, cls_tokens, t_cls_tokens))
+        text_loss = sum(loss_fn(s, t) for loss_fn, s, t in zip(self.t_losses, end_tokens, t_end_tokens))
+        return vision_loss + text_loss
 
 
 class EmbTrans(nn.Module):
+    """视觉特征到教师维度的对齐（BatchNorm + Dropout + Linear）。"""
+
     def __init__(self, args):
         super(EmbTrans, self).__init__()
         self.model_name = args.model
 
-        if 'ViT-M-16' in self.model_name:
-            s_emb = 512
-            t_emb = 768
-            self.fc1 = nn.Sequential(
-                nn.BatchNorm1d(s_emb),
-                nn.Dropout(0.5),
-                nn.Linear(s_emb, t_emb)
-            )
-
-        elif 'ViT-S-16' in self.model_name:
-            s_emb = 384
-            t_emb = 768
-            self.fc1 = nn.Sequential(
-                nn.BatchNorm1d(s_emb),
-                nn.Dropout(0.5),
-                nn.Linear(s_emb, t_emb)
-            )
-
-        elif 'ViT-T-16' in self.model_name:
-            s_emb = 192
-            t_emb = 768
-            self.fc1 = nn.Sequential(
-                nn.BatchNorm1d(s_emb),
-                nn.Dropout(0.5),
-                nn.Linear(s_emb, t_emb)
-            )
-        else:
+        dims = get_student_dims(args.model)
+        if dims is None:
             self.fc1 = None
+            return
 
+        s_emb = dims[0]
+        self.fc1 = nn.Sequential(
+            nn.BatchNorm1d(s_emb),
+            nn.Dropout(0.5),
+            nn.Linear(s_emb, TEACHER_VISION_DIM)
+        )
+        self._init_weights()
+
+    def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.BatchNorm1d):
                 m.weight.data.fill_(1)
@@ -119,48 +78,29 @@ class EmbTrans(nn.Module):
                 m.bias.data.zero_()
 
     def forward(self, x):
-        if self.model_name in 'ViT-B-16':
-            return x
-        else:
-            if self.fc1 is not None:
-                cls_token = self.fc1(x)
-                return cls_token
-            else:
-                return x
+        return self.fc1(x) if self.fc1 is not None else x
 
 
 class txt_EmbTrans(nn.Module):
+    """文本特征到教师文本维度的对齐（LayerNorm + Dropout [+ Linear]）。"""
 
     def __init__(self, args):
         super(txt_EmbTrans, self).__init__()
         self.model_name = args.model
 
-        if 'ViT-M-16' in self.model_name:
-            s_emb = 512
-            self.fc1 = nn.Sequential(
-                nn.LayerNorm(s_emb),
-                nn.Dropout(0.5),
-            )
-
-        elif 'ViT-S-16' in self.model_name:
-            s_emb = 384
-            t_emb = 512
-            self.fc1 = nn.Sequential(
-                nn.LayerNorm(s_emb),
-                nn.Dropout(0.5),
-                nn.Linear(s_emb, t_emb)
-            )
-        elif 'ViT-T-16' in self.model_name:
-            s_emb = 384
-            t_emb = 512
-            self.fc1 = nn.Sequential(
-                nn.LayerNorm(s_emb),
-                nn.Dropout(0.5),
-                nn.Linear(s_emb, t_emb)
-            )
-        else:
+        dims = get_student_dims(args.model)
+        if dims is None:
             self.fc1 = None
+            return
 
+        s_emb = dims[1]
+        layers = [nn.LayerNorm(s_emb), nn.Dropout(0.5)]
+        if s_emb != TEACHER_TEXT_DIM:
+            layers.append(nn.Linear(s_emb, TEACHER_TEXT_DIM))
+        self.fc1 = nn.Sequential(*layers)
+        self._init_weights()
+
+    def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.LayerNorm):
                 m.weight.data.fill_(1)
@@ -169,34 +109,22 @@ class txt_EmbTrans(nn.Module):
                 m.bias.data.zero_()
 
     def forward(self, x):
-        if self.model_name in 'ViT-B-16':
-            return x
-        else:
-            if self.fc1 is not None:
-                cls_token = self.fc1(x)
-                return cls_token
-            else:
-                return x
+        return self.fc1(x) if self.fc1 is not None else x
 
 
 class loss(nn.Module):
+    """单层特征的方向 + L2 蒸馏损失，浅层更侧重方向一致性。"""
+
     def __init__(self, layer=0):  # 层数默认为0
         super(loss, self).__init__()
-        self.total_layers = 12
         self.layer = layer
-        self.kl_loss = DistillKL(T=1)
-
-        # 线性衰减
-        self.distance_weight = 1.0 - layer / (self.total_layers - 1)
+        # 线性衰减：越靠近输入层，角度损失的权重越大
+        self.distance_weight = 1.0 - layer / (TOTAL_LAYERS - 1)
 
     def project(self, s_emb, t_emb):
         assert s_emb.size() == t_emb.size()
-        feat_dim = s_emb.shape[1]
         angle_loss = 0.0
         distance_loss = 0.0
-        kld_loss = 0.0
-
-        sqrt_dim = math.sqrt(feat_dim)
 
         for s, t in zip(s_emb, t_emb):
             # 归一化学生和教师特征
@@ -204,32 +132,13 @@ class loss(nn.Module):
             t_norm = t / t.norm(p=2)
             # 计算方向相似性损失
             angle_loss += 1 - torch.dot(s_norm, t_norm)
-            # 计算L2距离损失，除以特征维度的平方根进行缩放
+            # 计算L2距离损失
             distance_loss += F.mse_loss(s, t)
-            # # kld
-            # s_k = s_emb.unsqueeze(0)
-            # t_k = t_emb.unsqueeze(0)
-            # kld_loss += self.kl_loss(s_k, t_k) / sqrt_dim
 
         # 组合损失，按权重加权
-        total_loss = ((angle_loss + kld_loss) * (1 - self.distance_weight) +
-                      distance_loss * self.distance_weight)
-        return total_loss
+        return (angle_loss * (1 - self.distance_weight) +
+                distance_loss * self.distance_weight)
 
     def forward(self, s_emb, t_emb):
         nd_loss = self.project(s_emb=s_emb, t_emb=t_emb)
         return nd_loss / len(s_emb)  # 返回平均损失
-
-
-class DistillKL(nn.Module):
-    """Distilling the Knowledge in a Neural Network"""
-
-    def __init__(self, T):
-        super(DistillKL, self).__init__()
-        self.T = T
-
-    def forward(self, y_s, y_t):
-        p_s = F.log_softmax(y_s / self.T, dim=1)
-        p_t = F.softmax(y_t / self.T, dim=1)
-        loss = F.kl_div(p_s, p_t, reduction='batchmean') * (self.T ** 2)
-        return loss

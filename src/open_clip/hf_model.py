@@ -10,9 +10,9 @@ import torch.nn as nn
 from torch import TensorType
 try:
     import transformers
-    from transformers import AutoModel, AutoTokenizer, AutoConfig, PretrainedConfig
+    from transformers import AutoModel, AutoConfig, PretrainedConfig
     from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, BaseModelOutputWithPoolingAndCrossAttentions
-except ImportError as e:
+except ImportError:
     transformers = None
     class BaseModelOutput: pass
     class PretrainedConfig: pass

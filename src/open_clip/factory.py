@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import pathlib
 import re
 from copy import deepcopy
 from pathlib import Path
@@ -17,7 +16,7 @@ from .pretrained import is_pretrained_cfg, get_pretrained_cfg, download_pretrain
 from .transform import image_transform
 from .tokenizer import HFTokenizer, tokenize
 
-_MODEL_CONFIG_PATHS = [Path(__file__).parent / f"model_configs/"]
+_MODEL_CONFIG_PATHS = [Path(__file__).parent / "model_configs/"]
 _MODEL_CONFIGS = {}  # directory (model_name: config) of model architecture configs
 
 
@@ -104,13 +103,13 @@ def load_mae_checkpoint(model, checkpoint_path, strict=True):
 
     for k in ['head.weight', 'head.bias']:
         if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-            print(f"Removing key {k} from pretrained checkpoint")
+            logging.info(f"Removing key {k} from pretrained checkpoint")
             del checkpoint_model[k]
 
     # interpolate position embedding
     interpolate_pos_embed(model, checkpoint_model)
     model.load_state_dict(checkpoint_model, strict=True)
-    print('Load MAE-pretrained model successfully!')
+    logging.info('Load MAE-pretrained model successfully!')
     # detect old format and make compatible with new format
     return model
 

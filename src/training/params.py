@@ -27,26 +27,26 @@ def parse_args(args):
     parser.add_argument(
         "--train-data",
         type=str,
-        default='D:\Project\paper\cc3m-data\\train\cc3m-train.csv',
-        help="Path to csv filewith training data",
+        default=None,
+        help="Path to csv file with training data",
     )
     parser.add_argument(
         "--val-data",
         type=str,
-        default='D:\Project\paper\cc3m-data\\val\cc3m-val.csv',
+        default=None,
         help="Path to csv file with validation data",
     )
     parser.add_argument(
         "--data-root",
         type=str,
-        default='D:\Project\paper\cc3m-data\\train',
-        help="Path to data",
+        default='',
+        help="Root directory of training images (empty means paths in the csv are used as-is)",
     )
     parser.add_argument(
         "--val-data-root",
         type=str,
-        default='D:\Project\paper\cc3m-data\\val',
-        help="Path to data",
+        default='',
+        help="Root directory of validation images (empty means paths in the csv are used as-is)",
     )
     parser.add_argument(
         "--imagenet-val",
@@ -80,8 +80,8 @@ def parse_args(args):
     parser.add_argument(
         "--t-model-checkpoint",  # 教师权重路径
         type=str,
-        default="D:\Project\CLIP-SDMG\\t_model\ViT_B_16_cc3m_12m_ep32.pt",
-        help="teacher checkpoint path",
+        default=None,
+        help="Path to the teacher model checkpoint",
     )
     # FD
     parser.add_argument("--alpha_fd_loss", type=float, default=2000., help="FD_loss weight")

@@ -9,6 +9,12 @@ from torch.utils.checkpoint import checkpoint
 
 from .utils import to_2tuple
 
+# 教师模型不参与文本 token 遮挡
+TEACHER_MODEL_NAME = 'ViT-B-16'
+# 文本编码器开始随机遮挡的层号与遮挡比例
+TEXT_MASK_LAYER = 6
+TEXT_MASK_RATIO = 0.2
+
 
 class LayerNormFp32(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16 (by casting to float32 and back)."""
@@ -145,19 +151,10 @@ class ResidualAttentionBlock(nn.Module):
         ]))
         self.ls_2 = LayerScale(d_model, ls_init_value) if ls_init_value else nn.Identity()
 
-    # def attention(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
-    #     attn_mask = attn_mask.to(x.dtype) if attn_mask is not None else None
-    #     return self.attn(x, x, x, need_weights=False, attn_mask=attn_mask)[0]
-
     def attention(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
         attn_mask = attn_mask.to(x.dtype) if attn_mask is not None else None
         attn_output, attn_weights = self.attn(x, x, x, need_weights=True, attn_mask=attn_mask)
         return attn_output, attn_weights  # 返回注意力输出和注意力矩阵
-
-    # def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
-    #     x = x + self.ls_1(self.attention(self.ln_1(x), attn_mask=attn_mask))
-    #     x = x + self.ls_2(self.mlp(self.ln_2(x)))
-    #     return x
 
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
         attn_output, attn_weights = self.attention(self.ln_1(x), attn_mask=attn_mask)
@@ -271,12 +268,12 @@ class text_Transformer(nn.Module):
         ])
 
         # 开始遮挡的层数
-        self.layer = 6
+        self.layer = TEXT_MASK_LAYER
         # 模型名称
         self.model_name = model_name
         # 随机遮挡比例
-        self.p = 0.2
-        if self.model_name != "ViT-B-16":
+        self.p = TEXT_MASK_RATIO
+        if self.model_name != TEACHER_MODEL_NAME:
             self.mask_token = nn.Parameter(torch.zeros(1, 1, width))
             nn.init.normal_(self.mask_token, std=0.02)
 
@@ -296,7 +293,7 @@ class text_Transformer(nn.Module):
             # 保存每一层的中间特征
             intermediate_features.append(x.clone())
             # 1. 判断当前层数和模型名称是否一致
-            if i == self.layer and self.model_name != "ViT-B-16":
+            if i == self.layer and self.model_name != TEACHER_MODEL_NAME:
                 # [77, batch, dim] -> [batch, 77, dim]
                 x = x.permute(1, 0, 2)
                 # 随机遮挡文本token

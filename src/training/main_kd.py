@@ -4,6 +4,7 @@ import sys
 import random
 import json
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -38,7 +39,13 @@ def random_seed(seed=42):
 def main(args):
     args = parse_args(args)  # 训练的相关信息
 
-    if torch.cuda.is_available():  # 判断GPU可用
+    # 当前实现仅支持单卡训练，显式设置供数据/评估模块判断
+    args.distributed = False
+    args.world_size = 1
+
+    # 设备选择：有 GPU 时使用 CUDA，否则回退到 CPU
+    args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if args.device.type == 'cuda':
         # This enables tf32 on Ampere GPUs which is only 8% slower than
         # float16 and almost as accurate as float32
         # This was a default in pytorch until 1.12
@@ -46,14 +53,11 @@ def main(args):
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
 
-        # 设置GPU
-        args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
     # sanitize model name for filesystem / uri use, easier if we don't use / in name as a rule?
     args.model = args.model.replace('/', '-')
 
-    # 模型参数信息路径
-    configs_path = 'D:\Project\CLIP-KD\src\open_clip\model_configs'
+    # 模型参数信息路径（相对于本文件定位，避免依赖机器上的绝对路径）
+    configs_path = Path(__file__).resolve().parents[1] / 'open_clip' / 'model_configs'
 
     # 获取教师模型参数信息
     config_path = os.path.join(configs_path, f'{args.t_model}.json')
@@ -70,6 +74,8 @@ def main(args):
         args.s_embed_dim = config['embed_dim']
         args.patch_vis = config['vision_cfg']['width']
         args.token_txt = config['text_cfg']['width']
+        args.s_vocab_size = config['text_cfg']['vocab_size']
+        args.s_context_length = config['text_cfg']['context_length']
 
     # 设置本次实验的名称
     if args.name is None:
@@ -88,9 +94,7 @@ def main(args):
     os.makedirs(log_base_path, exist_ok=True)
     args.log_path = os.path.join(log_base_path, 'out.log')
     if os.path.exists(args.log_path):
-        print(
-            "Error. Experiment already exists."
-        )
+        logging.error("Error. Experiment already exists.")
         return -1
 
     # 设置日志级别
@@ -154,6 +158,8 @@ def main(args):
     t_model.eval()
     for t_n, t_p in t_model.named_parameters():
         t_p.requires_grad = False
+    if not args.t_model_checkpoint:
+        raise ValueError('--t-model-checkpoint is required to load the teacher weights.')
     checkpoint = torch.load(args.t_model_checkpoint, map_location='cpu')
     """
     ViT_B_16_cc3m_12m_ep32.pt使用sd = checkpoint["state_dict"]
@@ -164,7 +170,7 @@ def main(args):
     if next(iter(sd.items()))[0].startswith('module'):
         sd = {k[len('module.'):]: v for k, v in sd.items()}
     t_model.load_state_dict(sd)
-    print('Teacher model loaded successfully')
+    logging.info('Teacher model loaded successfully')
 
     # 损失
     loss = KDClipLoss(
@@ -172,7 +178,7 @@ def main(args):
         local_loss=args.local_loss,
         gather_with_grad=args.gather_with_grad,
         cache_labels=True,
-        use_horovod=args.horovod).cuda()
+        use_horovod=args.horovod).to(args.device)
 
     # create optimizer and scaler
     optimizer = None
@@ -276,7 +282,7 @@ def main(args):
 
     # 教师测试跨模态图文检索性能
     if args.t_eval:
-        print('evaluate teacher:')
+        logging.info('Evaluating teacher:')
         evaluate(t_model, data, start_epoch, args, writer)
 
     for epoch in range(start_epoch, args.epochs):
@@ -309,7 +315,7 @@ def main(args):
             if args.save_most_recent:
                 torch.save(
                     checkpoint_dict,
-                    os.path.join(args.checkpoint_path, f"epoch_latest.pt"),
+                    os.path.join(args.checkpoint_path, "epoch_latest.pt"),
                 )
 
     logging.info(f'The files are saved at {args.logs}')

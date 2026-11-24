@@ -1,7 +1,16 @@
 import torch
 from torch import nn
+
 from src.generation_module.SEG import SEModule
 from src.generation_module.MLM import MLM
+
+from .common import TEACHER_VISION_DIM, get_student_dims
+
+# 视觉/文本生成损失的缩放系数
+GEN_BETA_VISION = 0.000003
+GEN_BETA_TEXT = 0.006
+# 视觉 token 的遮挡比例
+GEN_MASK_RATIO = 0.5
 
 
 class gen_loss(nn.Module):
@@ -13,12 +22,11 @@ class gen_loss(nn.Module):
         self.mlm = MLM(args)
         # 文本生成损失
         self.mlm_loss = nn.CrossEntropyLoss(reduction='sum', ignore_index=0)
+        self.mse_sum = nn.MSELoss(reduction='sum')
 
     def forward(self, intermediate_features, t_intermediate_features,
                 txt_intermediate_features, texts):
         # 视觉生成部分
-        loss_mse = nn.MSELoss(reduction='sum')
-        beta_vitkd = 0.000003
         v_gen = self.mvm(intermediate_features[-1][:, 1:, :])
         x = v_gen['tokens']
         B = x.shape[0]
@@ -27,8 +35,8 @@ class gen_loss(nn.Module):
 
         high_t = t_intermediate_features[-1][:, 1:, :]
 
-        loss_gen = loss_mse(torch.mul(x, mask), torch.mul(high_t, mask))
-        loss_gen_vision = loss_gen / B * beta_vitkd / lambda_vitkd
+        loss_gen = self.mse_sum(torch.mul(x, mask), torch.mul(high_t, mask))
+        loss_gen_vision = loss_gen / B * GEN_BETA_VISION / lambda_vitkd
 
         # 文本生成部分
         """
@@ -36,54 +44,39 @@ class gen_loss(nn.Module):
         eos_id 49407 
         编码器的输出 [<bos>, token1, token2, ....., tokenN, <eos>, ...]
         """
-        beta_vitkd_txt = 0.006
         # 获取取编码器的输出和有效长度(以0为起始)
         encode_output, encode_length = txt_intermediate_features[-1], texts.argmax(dim=-1)
         logits = self.mlm(encode_output, encode_length)
 
         # 计算损失
         texts = texts[:, 1:]
-        loss_gen_txt = self.mlm_loss(logits.reshape(-1, logits.size(-1)), texts.reshape(-1)) * beta_vitkd_txt
+        loss_gen_txt = self.mlm_loss(logits.reshape(-1, logits.size(-1)), texts.reshape(-1)) * GEN_BETA_TEXT
 
         return loss_gen_txt + loss_gen_vision
 
 
 # VIT 11生成
 class gen_EmbTrans(nn.Module):
+    """最后一层的掩码生成：先对齐到教师维度，再遮挡部分 token 并重建。"""
+
     def __init__(self,
                  model_name,
-                 lambda_vitkd=0.5,
+                 lambda_vitkd=GEN_MASK_RATIO,
                  ):
         super(gen_EmbTrans, self).__init__()
         self.model_name = model_name
         # 遮挡比例
         self.lambda_vitkd = lambda_vitkd
 
-        if 'ViT-M-16' in model_name:
-            student_dims = 512
-            teacher_dims = 768
-            self.align = nn.Linear(student_dims, teacher_dims, bias=True)
-            self.mask_token = nn.Parameter(torch.zeros(1, 1, teacher_dims))
-            self.generation = SEModule(teacher_dims)
-
-
-        elif 'ViT-S-16' in model_name:
-            student_dims = 384
-            teacher_dims = 768
-            self.align = nn.Linear(student_dims, teacher_dims, bias=True)
-
-            self.mask_token = nn.Parameter(torch.zeros(1, 1, teacher_dims))
-            self.generation = SEModule(teacher_dims)
-
-        elif 'ViT-T-16' in model_name:
-            student_dims = 192
-            teacher_dims = 768
-            self.align = nn.Linear(student_dims, teacher_dims, bias=True)
-
-            self.mask_token = nn.Parameter(torch.zeros(1, 1, teacher_dims))
-            self.generation = SEModule(teacher_dims)
-        else:
+        dims = get_student_dims(model_name)
+        if dims is None:
             self.align = None
+            return
+
+        student_dims = dims[0]
+        self.align = nn.Linear(student_dims, TEACHER_VISION_DIM, bias=True)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, TEACHER_VISION_DIM))
+        self.generation = SEModule(TEACHER_VISION_DIM)
 
     def forward(self, preds):
         """Forward function.
@@ -150,52 +143,3 @@ class gen_EmbTrans(nn.Module):
         mask = torch.gather(mask, dim=1, index=ids_restore)
 
         return x_keep, mask, ids_restore, ids_masked
-
-# class gen_txt_EmbTrans(nn.Module):
-#     def __init__(self, model_name):
-#         super(gen_txt_EmbTrans, self).__init__()
-#         self.model_name = model_name
-#         # 解码器层数
-#         self.num_layers = 2
-#         # 解码器的config
-#
-#
-#
-#         if self.model_name in ['ViT-M-16']:
-#             student_dims = 512
-#             teacher_dims = 512
-#             # 对齐层，将学生模型维度映射到教师模型维度
-#             self.align = nn.Linear(student_dims, teacher_dims, bias=True)
-#             # Mask token初始化
-#             self.mask_token = nn.Parameter(torch.zeros(1, 1, teacher_dims))  # [1, 1, teacher_dims]
-#             # 生成模块
-#             self.generation = Decoder(embed_dim=teacher_dims, num_heads=8, dropout=0.1, num_layers=self.num_layers)
-#         elif self.model_name in ['ViT-S-16', 'ViT-T-16']:
-#             student_dims = 384
-#             teacher_dims = 512
-#             self.align = nn.Linear(student_dims, teacher_dims, bias=True)
-#             self.mask_token = nn.Parameter(torch.zeros(1, 1, teacher_dims))  # [1, 1, teacher_dims]
-#             self.generation = Decoder(embed_dim=teacher_dims, num_heads=8, dropout=0.1, num_layers=self.num_layers)
-#         else:
-#             self.align = None
-#
-#     def forward(self, text, feature):
-#         """ 输入text是token序列，形状为 [B, N]，输入feature是学生模型的特征，形状为 [B, N, D] """
-#
-#         gen_variable = {}
-#
-#         if self.align is not None:
-#             if self.model_name in ['ViT-S-16', 'ViT-T-16']:
-#                 feature = self.align(feature)
-#             masked_feature, mask = self.random_masking(text, feature, mask_ratio=self.lambda_vitkd)
-#             # 将 tgt_mask 传入解码器
-#             output = self.generation(masked_feature)
-#
-#             gen_variable['tokens'] = output
-#             gen_variable['mask'] = mask
-#             gen_variable['mask_ratio'] = self.lambda_vitkd
-#         else:
-#             gen_variable['tokens'] = feature
-#
-#         return gen_variable
-#

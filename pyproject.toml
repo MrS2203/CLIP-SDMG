@@ -1,0 +1,14 @@
+# 本文件只用于统一 lint 配置；本仓库不通过 pip 安装为 Python 包。
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+extend-exclude = ["logs", "wandb"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",  # 行宽交由 formatter 统一处理
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
